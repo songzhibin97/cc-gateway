@@ -1,0 +1,41 @@
+server:
+  listen: ":8080"
+  admin_listen: ":8081"
+  read_timeout: "30s"
+  write_timeout: "300s"
+  idle_timeout: "120s"
+
+database:
+  path: "./data/gateway.db"
+
+log:
+  level: "info"
+  payload_retention_days: 7
+
+pricing:
+  - model: "claude-3-5-haiku*"
+    input_per_million: 0.8
+    output_per_million: 4.0
+    thinking_per_million: 0
+  - model: "claude-3-7-sonnet*"
+    input_per_million: 3.0
+    output_per_million: 15.0
+    thinking_per_million: 0
+  - model: "gpt-4o*"
+    input_per_million: 5.0
+    output_per_million: 15.0
+    thinking_per_million: 0
+  - model: "gpt-4.1*"
+    input_per_million: 2.0
+    output_per_million: 8.0
+    thinking_per_million: 0
+  - model: "gemini-1.5-flash*"
+    input_per_million: 0.35
+    output_per_million: 1.05
+    thinking_per_million: 0
+  - model: "gemini-1.5-pro*"
+    input_per_million: 3.5
+    output_per_million: 10.5
+    thinking_per_million: 0
+
+# Accounts, groups, and gateway API keys are managed in SQLite via the Admin API.
