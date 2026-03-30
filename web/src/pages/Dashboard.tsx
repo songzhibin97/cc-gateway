@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import type { AxiosError } from 'axios';
-import { Card, Col, Row, Space, Spin, Statistic, Table, Typography, message } from 'antd';
+import { Card, Col, Row, Space, Spin, Statistic, Table, Tooltip, Typography, message } from 'antd';
 import type { TableProps } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import { listAccounts } from '../api/accounts';
@@ -82,7 +82,7 @@ const Dashboard: React.FC = () => {
         render: renderAccountStatus,
       },
       {
-        title: '熔断器',
+        title: <Tooltip title="closed=正常放行，open=已熔断拦截，half_open=试探恢复">熔断状态</Tooltip>,
         dataIndex: 'breaker_state',
         key: 'breaker_state',
         render: renderBreakerState,

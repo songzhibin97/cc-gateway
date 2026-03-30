@@ -225,13 +225,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sseWriter := sse.NewWriter(rw)
+		retryConfig := extractRetryConfig(account)
 		activeRequests := metrics.ActiveRequests.WithLabelValues(account.ID)
-		activeRequests.Inc()
-		usage, streamErr := func() (*domain.Usage, error) {
-			defer activeRequests.Dec()
-			return prov.Stream(ctx, account, &req, sseWriter)
-		}()
+
+		var usage *domain.Usage
+		var streamErr error
+		for retry := 0; retry <= retryConfig.MaxRetries; retry++ {
+			if retry > 0 {
+				delay := retryConfig.Backoff(retry)
+				h.logger.Warn("retrying request on same account",
+					slog.String("account_id", account.ID),
+					slog.Int("retry", retry),
+					slog.Duration("backoff", delay),
+				)
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					releaseInflight()
+					recordErr = "context cancelled during retry backoff"
+					h.writeError(rw, http.StatusBadGateway, "api_error", recordErr)
+					return
+				}
+			}
+
+			sseWriter := sse.NewWriter(rw)
+			activeRequests.Inc()
+			usage, streamErr = func() (*domain.Usage, error) {
+				defer activeRequests.Dec()
+				return prov.Stream(ctx, account, &req, sseWriter)
+			}()
+			if streamErr == nil {
+				break
+			}
+			if rw.writeCount > 0 || rw.wroteHeader || !retryConfig.IsRetryable(streamErr) {
+				break
+			}
+		}
 		releaseInflight()
 		duration := time.Since(start)
 

@@ -1,4 +1,4 @@
-import { Badge, Tag } from 'antd';
+import { Badge, Tag, Tooltip } from 'antd';
 import type { Account } from '../types';
 
 export const providerOptions: Array<{ label: string; value: Account['provider'] }> = [
@@ -48,12 +48,34 @@ export const renderBreakerState = (state?: string) => {
   const normalized = state ?? 'unknown';
   const config =
     normalized === 'closed'
-      ? { status: 'success' as const, text: 'closed' }
+      ? {
+          status: 'success' as const,
+          text: '正常（closed）',
+          description: 'closed 表示电路闭合，请求正常放行。',
+        }
       : normalized === 'half_open'
-        ? { status: 'warning' as const, text: 'half_open' }
+        ? {
+            status: 'warning' as const,
+            text: '试探恢复（half_open）',
+            description: 'half_open 表示熔断后进入试探恢复阶段，会放少量请求探测上游是否恢复。',
+          }
         : normalized === 'open'
-          ? { status: 'error' as const, text: 'open' }
-          : { status: 'default' as const, text: normalized };
+          ? {
+              status: 'error' as const,
+              text: '已熔断（open）',
+              description: 'open 表示电路断开，请求会被暂时拦截，不是“正常开放”。',
+            }
+          : {
+              status: 'default' as const,
+              text: `未知（${normalized}）`,
+              description: `未识别的熔断状态：${normalized}`,
+            };
 
-  return <Badge status={config.status} text={config.text} />;
+  return (
+    <Tooltip title={config.description}>
+      <span>
+        <Badge status={config.status} text={config.text} />
+      </span>
+    </Tooltip>
+  );
 };

@@ -15,7 +15,7 @@ export interface Account {
     success_threshold: number;
     open_duration: string;
   };
-  extra: Record<string, any> | null;
+  extra: Record<string, unknown> | null;
   breaker_state?: string;
 }
 

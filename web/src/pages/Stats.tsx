@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AxiosError } from 'axios';
 import dayjs, { type Dayjs } from 'dayjs';
 import ReactECharts from 'echarts-for-react';
@@ -70,7 +70,7 @@ const Stats: React.FC = () => {
     return getPresetRange(preset === 'custom' ? 'today' : preset);
   }, [customRange, preset]);
 
-  const loadStats = async (nextDimension: Dimension, range: [Dayjs, Dayjs]) => {
+  const loadStats = useCallback(async (nextDimension: Dimension, range: [Dayjs, Dayjs]) => {
     setLoading(true);
     try {
       const utcRange = toUtcRange(range);
@@ -85,11 +85,11 @@ const Stats: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [messageApi]);
 
   useEffect(() => {
     void loadStats(dimension, currentRange);
-  }, [dimension, currentRange]);
+  }, [currentRange, dimension, loadStats]);
 
   const summary = useMemo(
     () =>

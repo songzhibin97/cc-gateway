@@ -46,6 +46,15 @@ const renderValue = (value: unknown) => {
   return String(value);
 };
 
+const renderCircuitBreakerConfig = (config: Account['circuit_breaker']) => (
+  <Space direction="vertical" size={4}>
+    <Typography.Text>术语：closed=正常放行，open=已熔断拦截，half_open=试探恢复</Typography.Text>
+    <Typography.Text>触发条件：连续失败 {config.failure_threshold} 次后进入 open</Typography.Text>
+    <Typography.Text>熔断时长：进入 open 后保持 {config.open_duration}</Typography.Text>
+    <Typography.Text>恢复条件：half_open 下连续成功 {config.success_threshold} 次后回到 closed</Typography.Text>
+  </Space>
+);
+
 const AccountDetail: React.FC = () => {
   const navigate = useNavigate();
   const { id } = useParams<{ id: string }>();
@@ -149,7 +158,7 @@ const AccountDetail: React.FC = () => {
         {
           key: 'circuit_breaker',
           label: '熔断配置',
-          children: renderValue(account.circuit_breaker),
+          children: renderCircuitBreakerConfig(account.circuit_breaker),
         },
         { key: 'extra', label: 'Extra', children: renderValue(account.extra) },
       ]

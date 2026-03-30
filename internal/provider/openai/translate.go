@@ -61,6 +61,8 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		input = append(input, items...)
 	}
 
+	requestReasoning, requestWantsReasoning := translateReasoning(req.Thinking)
+
 	out := &responsesRequest{
 		Model:        req.Model,
 		Input:        input,
@@ -68,7 +70,7 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
 		Stream:       req.Stream,
-		Reasoning:    translateReasoning(req.Thinking),
+		Reasoning:    requestReasoning,
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
@@ -96,17 +98,17 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		out.Stop = req.StopSequences
 	}
 
-	// reasoning 配置：仅当请求自带 thinking 或账号 extra 明确配置时才发送。
-	// 绝不给没有要求 reasoning 的请求强加此字段。
-	effortKey := stringValue(extra["thinking_effort"])
-	if effortKey == "" {
-		effortKey = stringValue(extra["reasoning_effort"])
-	}
-	if effort := strings.TrimSpace(effortKey); effort != "" {
-		if out.Reasoning == nil {
-			out.Reasoning = &responsesReasoning{}
+	// reasoning 配置：只有请求自带 thinking 时才启用 reasoning。
+	// 具体 effort 优先走账号默认配置；若账号未配置，再回退到请求里可翻译的提示。
+	if requestWantsReasoning {
+		effortKey := stringValue(extra["thinking_effort"])
+		if effortKey == "" {
+			effortKey = stringValue(extra["reasoning_effort"])
 		}
-		if out.Reasoning.Effort == "" {
+		if effort := strings.TrimSpace(effortKey); effort != "" {
+			if out.Reasoning == nil {
+				out.Reasoning = &responsesReasoning{}
+			}
 			out.Reasoning.Effort = effort
 		}
 	}
@@ -293,28 +295,35 @@ func stringifyToolResultContent(content any) (string, error) {
 	}
 }
 
-func translateReasoning(raw json.RawMessage) *responsesReasoning {
+func translateReasoning(raw json.RawMessage) (*responsesReasoning, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil
+		return nil, false
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil
+		return nil, true
 	}
 
 	// Anthropic "thinking" settings do not map 1:1. Preserve only effort-like hints.
 	for _, key := range []string{"effort", "level"} {
 		if effort := strings.TrimSpace(stringValue(payload[key])); effort != "" {
-			return &responsesReasoning{Effort: effort}
+			return &responsesReasoning{Effort: effort}, true
 		}
 	}
 
-	if enabled, ok := payload["enabled"].(bool); ok && enabled {
-		return &responsesReasoning{Effort: "medium"}
+	switch strings.TrimSpace(stringValue(payload["type"])) {
+	case "enabled":
+		return &responsesReasoning{Effort: "medium"}, true
+	case "adaptive", "disabled":
+		return nil, true
 	}
 
-	return nil
+	if enabled, ok := payload["enabled"].(bool); ok && enabled {
+		return &responsesReasoning{Effort: "medium"}, true
+	}
+
+	return nil, true
 }
 
 func stringValue(v any) string {

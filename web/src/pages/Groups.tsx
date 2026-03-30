@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AxiosError } from 'axios';
 import {
   Button,
@@ -115,7 +115,7 @@ const Groups: React.FC = () => {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingGroup, setEditingGroup] = useState<KeyGroup | null>(null);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
       const [groupsResponse, accountsResponse, keysResponse] = await Promise.all([
@@ -131,11 +131,11 @@ const Groups: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [messageApi]);
 
   useEffect(() => {
     void loadData();
-  }, []);
+  }, [loadData]);
 
   const accountMap = useMemo(
     () => new Map(accounts.map((account) => [account.id, account])),

@@ -133,7 +133,7 @@ Content-Type: application/json
   - Anthropic `thinking` blocks → OpenAI `reasoning`（best-effort 映射）
   - SSE 事件实时翻译：`response.output_text.delta` → `content_block_delta`
 - **跨厂商映射**：在 `allowed_models` 中写入 Claude 模型名，`model_aliases` 中配置映射关系
-- `extra` 可选字段：`{"reasoning_effort": "high", "reasoning_summary": "auto"}`，作为 OpenAI 推理模型的账号默认值；若请求自带 `thinking` 映射出的 effort，则请求值优先
+- `extra` 可选字段：`{"reasoning_effort": "xhigh", "reasoning_summary": "auto"}`，作为 OpenAI 推理模型的账号默认值；支持 `low` / `medium` / `high` / `xhigh`；若请求自带 `thinking` 映射出的 effort，则请求值优先
 
 ---
 

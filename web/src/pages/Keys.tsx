@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AxiosError } from 'axios';
 import {
   Button,
@@ -109,7 +109,7 @@ const Keys: React.FC = () => {
     rawKey: '',
   });
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
       const [keysResponse, groupsResponse] = await Promise.all([listKeys(), listGroups()]);
@@ -120,11 +120,11 @@ const Keys: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [messageApi]);
 
   useEffect(() => {
     void loadData();
-  }, []);
+  }, [loadData]);
 
   const groupMap = useMemo(() => new Map(groups.map((group) => [group.id, group])), [groups]);
 
@@ -137,33 +137,33 @@ const Keys: React.FC = () => {
     [groups],
   );
 
-  const openCreateModal = () => {
+  const openCreateModal = useCallback(() => {
     setEditingKey(null);
     form.resetFields();
     form.setFieldsValue(getInitialValues());
     setModalOpen(true);
-  };
+  }, [form]);
 
-  const openEditModal = (key: APIKey) => {
+  const openEditModal = useCallback((key: APIKey) => {
     setEditingKey(key);
     form.resetFields();
     form.setFieldsValue(unpackKey(key));
     setModalOpen(true);
-  };
+  }, [form]);
 
-  const closeModal = () => {
+  const closeModal = useCallback(() => {
     setModalOpen(false);
     setEditingKey(null);
     form.resetFields();
-  };
+  }, [form]);
 
-  const showSecretModal = (title: string, rawKey: string) => {
+  const showSecretModal = useCallback((title: string, rawKey: string) => {
     setSecretModal({
       open: true,
       title,
       rawKey,
     });
-  };
+  }, []);
 
   const copyRawKey = async () => {
     try {
@@ -174,7 +174,7 @@ const Keys: React.FC = () => {
     }
   };
 
-  const handleSubmit = async (values: KeyFormValues) => {
+  const handleSubmit = useCallback(async (values: KeyFormValues) => {
     setSubmitting(true);
     try {
       const payload = buildPayload(values);
@@ -193,9 +193,9 @@ const Keys: React.FC = () => {
     } finally {
       setSubmitting(false);
     }
-  };
+  }, [closeModal, editingKey, loadData, messageApi, showSecretModal]);
 
-  const handleStatusToggle = async (key: APIKey, checked: boolean) => {
+  const handleStatusToggle = useCallback(async (key: APIKey, checked: boolean) => {
     try {
       await updateKeyStatus(key.id, checked ? 'enabled' : 'disabled');
       messageApi.success(`密钥已${checked ? '启用' : '禁用'}`);
@@ -203,9 +203,9 @@ const Keys: React.FC = () => {
     } catch (error) {
       messageApi.error(getErrorMessage(error));
     }
-  };
+  }, [loadData, messageApi]);
 
-  const handleRotate = async (key: APIKey) => {
+  const handleRotate = useCallback(async (key: APIKey) => {
     try {
       const response = await rotateKey(key.id);
       messageApi.success('密钥已轮换');
@@ -214,9 +214,9 @@ const Keys: React.FC = () => {
     } catch (error) {
       messageApi.error(getErrorMessage(error));
     }
-  };
+  }, [loadData, messageApi, showSecretModal]);
 
-  const handleDelete = async (key: APIKey) => {
+  const handleDelete = useCallback(async (key: APIKey) => {
     try {
       await deleteKey(key.id);
       messageApi.success('密钥已删除');
@@ -224,7 +224,7 @@ const Keys: React.FC = () => {
     } catch (error) {
       messageApi.error(getErrorMessage(error));
     }
-  };
+  }, [loadData, messageApi]);
 
   const columns = useMemo<TableProps<APIKey>['columns']>(
     () => [
@@ -322,7 +322,7 @@ const Keys: React.FC = () => {
         ),
       },
     ],
-    [groupMap],
+    [groupMap, handleDelete, handleRotate, handleStatusToggle, openEditModal],
   );
 
   return (

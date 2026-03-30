@@ -27,14 +27,8 @@ const AppLayout: React.FC = () => {
     }
     return window.matchMedia('(prefers-color-scheme: dark)').matches;
   });
-  const [tokenModal, setTokenModal] = useState(false);
+  const [tokenModal, setTokenModal] = useState(() => !localStorage.getItem('admin_token'));
   const [tokenInput, setTokenInput] = useState('');
-
-  useEffect(() => {
-    if (!localStorage.getItem('admin_token')) {
-      setTokenModal(true);
-    }
-  }, []);
 
   useEffect(() => {
     const handler = () => setTokenModal(true);

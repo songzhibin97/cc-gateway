@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AxiosError } from 'axios';
 import dayjs, { type Dayjs } from 'dayjs';
 import {
@@ -108,7 +108,7 @@ const Logs: React.FC = () => {
   const [payload, setPayload] = useState<RequestPayload | null>(null);
   const [payloadExpired, setPayloadExpired] = useState(false);
 
-  const loadOptions = async () => {
+  const loadOptions = useCallback(async () => {
     try {
       const [keysResponse, accountsResponse] = await Promise.all([listKeys(), listAccounts()]);
       setKeys(keysResponse.data ?? []);
@@ -116,9 +116,9 @@ const Logs: React.FC = () => {
     } catch (error) {
       messageApi.error(getErrorMessage(error));
     }
-  };
+  }, [messageApi]);
 
-  const loadLogs = async (nextPage: number, values?: LogFilterValues) => {
+  const loadLogs = useCallback(async (nextPage: number, values?: LogFilterValues) => {
     const filterValues = values ?? form.getFieldsValue();
     const [from, to] = filterValues.range ?? getTodayRange();
     setSearching(true);
@@ -145,12 +145,13 @@ const Logs: React.FC = () => {
       setLoading(false);
       setSearching(false);
     }
-  };
+  }, [form, messageApi]);
 
   useEffect(() => {
-    form.setFieldsValue(initialFilterValues());
-    void Promise.all([loadOptions(), loadLogs(1, initialFilterValues())]);
-  }, []);
+    const values = initialFilterValues();
+    form.setFieldsValue(values);
+    void Promise.all([loadOptions(), loadLogs(1, values)]);
+  }, [form, loadLogs, loadOptions]);
 
   const keyOptions = useMemo(
     () => (keys ?? []).map((key) => ({ label: `${key.id} (****${key.key_hint})`, value: key.id })),
