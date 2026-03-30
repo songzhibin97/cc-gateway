@@ -46,6 +46,14 @@ type anthropicTool struct {
 	InputSchema map[string]any `json:"input_schema,omitempty"`
 }
 
+const defaultReasoningEffort = "medium"
+
+type reasoningState struct {
+	reasoning         *responsesReasoning
+	enabled           bool
+	hasExplicitEffort bool
+}
+
 func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*responsesRequest, error) {
 	instructions, err := translateSystem(req.System)
 	if err != nil {
@@ -61,7 +69,7 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		input = append(input, items...)
 	}
 
-	requestReasoning, requestWantsReasoning := translateReasoning(req.Thinking)
+	requestReasoning := translateReasoning(req.Thinking)
 
 	out := &responsesRequest{
 		Model:        req.Model,
@@ -70,7 +78,7 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
 		Stream:       req.Stream,
-		Reasoning:    requestReasoning,
+		Reasoning:    requestReasoning.reasoning,
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
@@ -78,8 +86,9 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 
 	if len(req.Tools) > 0 {
 		toolFilter, _ := extra["tool_filter"].(string)
+		toolFilter = strings.TrimSpace(toolFilter)
 		if toolFilter == "" {
-			toolFilter = "strip_mcp" // 默认过滤 MCP 工具
+			toolFilter = "passthrough"
 		}
 		if toolFilter != "none" {
 			tools, err := translateTools(req.Tools, toolFilter)
@@ -98,18 +107,21 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		out.Stop = req.StopSequences
 	}
 
-	// reasoning 配置：只有请求自带 thinking 时才启用 reasoning。
-	// 具体 effort 优先走账号默认配置；若账号未配置，再回退到请求里可翻译的提示。
-	if requestWantsReasoning {
-		effortKey := stringValue(extra["thinking_effort"])
+	// reasoning 仅在请求明确要求 thinking 时启用。
+	if requestReasoning.enabled {
+		effortKey := strings.TrimSpace(stringValue(extra["thinking_effort"]))
 		if effortKey == "" {
-			effortKey = stringValue(extra["reasoning_effort"])
+			effortKey = strings.TrimSpace(stringValue(extra["reasoning_effort"]))
 		}
-		if effort := strings.TrimSpace(effortKey); effort != "" {
-			if out.Reasoning == nil {
-				out.Reasoning = &responsesReasoning{}
-			}
-			out.Reasoning.Effort = effort
+		if out.Reasoning == nil {
+			out.Reasoning = &responsesReasoning{}
+		}
+		if requestReasoning.hasExplicitEffort {
+			out.Reasoning.Effort = requestReasoning.reasoning.Effort
+		} else if effortKey != "" {
+			out.Reasoning.Effort = effortKey
+		} else if out.Reasoning.Effort == "" {
+			out.Reasoning.Effort = defaultReasoningEffort
 		}
 	}
 	// summary 只在 reasoning 已存在时补充，不凭空创建 reasoning
@@ -295,45 +307,63 @@ func stringifyToolResultContent(content any) (string, error) {
 	}
 }
 
-func translateReasoning(raw json.RawMessage) (*responsesReasoning, bool) {
+func translateReasoning(raw json.RawMessage) reasoningState {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, false
+		return reasoningState{}
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, true
+		return reasoningState{
+			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
+			enabled:   true,
+		}
 	}
 
 	// Anthropic "thinking" settings do not map 1:1. Preserve only effort-like hints.
 	for _, key := range []string{"effort", "level"} {
 		if effort := strings.TrimSpace(stringValue(payload[key])); effort != "" {
-			return &responsesReasoning{Effort: effort}, true
+			return reasoningState{
+				reasoning:         &responsesReasoning{Effort: effort},
+				enabled:           true,
+				hasExplicitEffort: true,
+			}
 		}
 	}
 
 	switch strings.TrimSpace(stringValue(payload["type"])) {
 	case "enabled":
-		return &responsesReasoning{Effort: "medium"}, true
-	case "adaptive", "disabled":
-		return nil, true
+		return reasoningState{
+			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
+			enabled:   true,
+		}
+	case "adaptive":
+		return reasoningState{
+			enabled: true,
+		}
+	case "disabled":
+		return reasoningState{}
 	}
 
-	if enabled, ok := payload["enabled"].(bool); ok && enabled {
-		return &responsesReasoning{Effort: "medium"}, true
+	if enabled, ok := payload["enabled"].(bool); ok {
+		if !enabled {
+			return reasoningState{}
+		}
+		return reasoningState{
+			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
+			enabled:   true,
+		}
 	}
 
-	return nil, true
+	return reasoningState{
+		reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
+		enabled:   true,
+	}
 }
 
 func stringValue(v any) string {
 	s, _ := v.(string)
 	return s
-}
-
-func isTrue(v any) bool {
-	b, _ := v.(bool)
-	return b
 }
 
 func translateToolChoice(raw json.RawMessage) any {

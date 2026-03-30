@@ -103,7 +103,7 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 	candidate := resp.Candidates[0]
 	for i, p := range candidate.Content.Parts {
 		switch {
-		case p.Thought && p.Text != "":
+		case p.Thought:
 			thinkIndex := c.nextIndex
 			c.nextIndex++
 			raw, err := formatAnthropicEvent("content_block_start", map[string]any{
@@ -118,17 +118,33 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 			}
 			payloads = append(payloads, raw)
 
-			raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
-				"index": thinkIndex,
-				"delta": map[string]any{
-					"type":     "thinking_delta",
-					"thinking": p.Text,
-				},
-			})
-			if err != nil {
-				return nil, c.usage, err
+			if p.Text != "" {
+				raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
+					"index": thinkIndex,
+					"delta": map[string]any{
+						"type":     "thinking_delta",
+						"thinking": p.Text,
+					},
+				})
+				if err != nil {
+					return nil, c.usage, err
+				}
+				payloads = append(payloads, raw)
 			}
-			payloads = append(payloads, raw)
+
+			if p.ThoughtSignature != "" {
+				raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
+					"index": thinkIndex,
+					"delta": map[string]any{
+						"type":      "signature_delta",
+						"signature": p.ThoughtSignature,
+					},
+				})
+				if err != nil {
+					return nil, c.usage, err
+				}
+				payloads = append(payloads, raw)
+			}
 
 			raw, err = formatAnthropicEvent("content_block_stop", map[string]any{
 				"index": thinkIndex,
@@ -174,6 +190,14 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 			payloads = append(payloads, raw)
 
 		case p.FunctionCall != nil:
+			if p.ThoughtSignature != "" {
+				signaturePayloads, err := c.emitSignatureCarrier(p.ThoughtSignature)
+				if err != nil {
+					return nil, c.usage, err
+				}
+				payloads = append(payloads, signaturePayloads...)
+			}
+
 			c.sawFunctionCall = true
 			key := fmt.Sprintf("part_%d", i)
 			state := c.toolStates[key]
@@ -204,12 +228,6 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 					return nil, c.usage, err
 				}
 				payloads = append(payloads, raw)
-			}
-
-			if c.toolSchemas != nil && p.FunctionCall.Args != nil {
-				if schema, ok := c.toolSchemas[p.FunctionCall.Name]; ok {
-					p.FunctionCall.Args = sanitizeArgs(p.FunctionCall.Args, schema)
-				}
 			}
 
 			argsJSON, err := marshalCompactJSON(p.FunctionCall.Args)
@@ -281,47 +299,6 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 	return payloads, c.usage, nil
 }
 
-func sanitizeArgs(args any, schema *ToolSchema) any {
-	m, ok := args.(map[string]any)
-	if !ok {
-		m = make(map[string]any)
-	}
-
-	// 补全缺失的 required 参数：用已有参数中最长的 string 值作为 fallback，
-	// 比空字符串更有意义（例如 Agent 的 description 可以填充缺失的 prompt）。
-	for _, req := range schema.Required {
-		if v, exists := m[req]; !exists || v == nil || v == "" {
-			m[req] = longestStringValue(m, req)
-		}
-	}
-
-	// 过滤多余参数
-	filtered := make(map[string]any, len(schema.Allowed))
-	for k, v := range m {
-		if schema.Allowed[k] {
-			filtered[k] = v
-		}
-	}
-	return filtered
-}
-
-// longestStringValue 从 args 中找最长的 string 值（排除 excludeKey 自身）作为 fallback。
-func longestStringValue(m map[string]any, excludeKey string) string {
-	var best string
-	for k, v := range m {
-		if k == excludeKey {
-			continue
-		}
-		if s, ok := v.(string); ok && len(s) > len(best) {
-			best = s
-		}
-	}
-	if best == "" {
-		best = "execute"
-	}
-	return best
-}
-
 func (c *StreamConverter) Finalize() [][]byte {
 	if !c.started {
 		return nil
@@ -366,6 +343,47 @@ func (c *StreamConverter) Finalize() [][]byte {
 	}
 
 	return payloads
+}
+
+func (c *StreamConverter) emitSignatureCarrier(signature string) ([][]byte, error) {
+	if signature == "" {
+		return nil, nil
+	}
+
+	index := c.nextIndex
+	c.nextIndex++
+
+	start, err := formatAnthropicEvent("content_block_start", map[string]any{
+		"index": index,
+		"content_block": map[string]any{
+			"type":     "thinking",
+			"thinking": "",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	delta, err := formatAnthropicEvent("content_block_delta", map[string]any{
+		"index": index,
+		"delta": map[string]any{
+			"type":      "signature_delta",
+			"signature": signature,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	stop, err := formatAnthropicEvent("content_block_stop", map[string]any{
+		"index": index,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c.contentBlockCompleted = true
+	return [][]byte{start, delta, stop}, nil
 }
 
 func (c *StreamConverter) closeOpenBlocks() ([][]byte, error) {
@@ -458,7 +476,9 @@ func mapFinishReason(reason string) string {
 	case "MALFORMED_FUNCTION_CALL":
 		return "end_turn"
 	default:
-		return strings.ToLower(reason)
+		// Gemini exposes more finish reasons than Anthropic understands.
+		// Prefer a safe Anthropic-compatible fallback over inventing a new stop reason.
+		return "end_turn"
 	}
 }
 

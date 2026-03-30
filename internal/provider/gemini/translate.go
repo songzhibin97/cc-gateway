@@ -26,6 +26,7 @@ type content struct {
 type part struct {
 	Text             string            `json:"text,omitempty"`
 	Thought          bool              `json:"thought,omitempty"`
+	ThoughtSignature string            `json:"thoughtSignature,omitempty"`
 	FunctionCall     *functionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *functionResponse `json:"functionResponse,omitempty"`
 }
@@ -70,7 +71,9 @@ type generationConfig struct {
 }
 
 type thinkingConfig struct {
-	ThinkingBudget int `json:"thinkingBudget,omitempty"`
+	ThinkingBudget int    `json:"thinkingBudget,omitempty"`
+	ThinkingLevel  string `json:"thinkingLevel,omitempty"`
+	IncludeThoughts bool  `json:"includeThoughts,omitempty"`
 }
 
 type safetySetting struct {
@@ -87,11 +90,19 @@ type anthropicTool struct {
 type anthropicContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	Signature string          `json:"signature,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
+}
+
+type thinkingRequest struct {
+	Enabled bool
+	Adaptive bool
+	Effort  string
+	Budget  int
 }
 
 // ToolSchema holds allowed parameter names and required fields for a tool.
@@ -169,11 +180,12 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*gene
 			return nil, fmt.Errorf("translate tools: %w", err)
 		}
 
-		// Filter tools: default "strip_mcp" drops MCP tools, "none" drops all,
-		// "passthrough" keeps everything.
+		// Filter tools: "none" drops all, "strip_mcp" drops MCP tools,
+		// and the default "passthrough" keeps everything.
 		toolFilter, _ := extra["tool_filter"].(string)
+		toolFilter = strings.TrimSpace(toolFilter)
 		if toolFilter == "" {
-			toolFilter = "strip_mcp"
+			toolFilter = "passthrough"
 		}
 
 		declarations := make([]functionDeclaration, 0, len(tools))
@@ -209,35 +221,9 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*gene
 	if len(req.StopSequences) > 0 {
 		cfg.StopSequences = req.StopSequences
 	}
-	// thinking 仅对支持的模型启用（gemini-2.5+, gemini-3+）
-	// gemini-2.0-flash 等旧模型不支持，发了会 400
-	thinkingSupported := modelSupportsThinking(req.Model)
-
-	effort := ""
-	if thinkingSupported {
-		effort = strings.TrimSpace(stringValue(extra["thinking_effort"]))
-		if effort == "" {
-			effort = strings.TrimSpace(stringValue(extra["reasoning_effort"]))
-		}
-		if effort == "" && isTrue(extra["thinking_enabled"]) {
-			effort = "medium"
-		}
-	}
-	if effort != "" {
-		budget := positiveInt(extra["thinking_budget"])
-		if budget <= 0 {
-			switch effort {
-			case "low":
-				budget = 1024
-			case "medium":
-				budget = 4096
-			case "high":
-				budget = 8192
-			default:
-				budget = 4096
-			}
-		}
-		cfg.ThinkingConfig = &thinkingConfig{ThinkingBudget: budget}
+	// thinking 仅在请求明确要求时启用（Gemini 2.5+, Gemini 3+）。
+	if thinking := parseThinkingRequest(req.Thinking); thinking.Enabled && modelSupportsThinking(req.Model) {
+		cfg.ThinkingConfig = buildThinkingConfig(req.Model, thinking, extra)
 	}
 	if cfg.MaxOutputTokens > 0 || cfg.Temperature != nil || cfg.TopP != nil || cfg.TopK != nil || len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
 		out.GenerationConfig = cfg
@@ -255,11 +241,6 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*gene
 	}
 
 	return out, nil
-}
-
-func isTrue(v any) bool {
-	b, ok := v.(bool)
-	return ok && b
 }
 
 func positiveInt(v any) int {
@@ -414,6 +395,7 @@ func translateRawContent(raw json.RawMessage, toolNameByID map[string]string) ([
 	}
 
 	out := make([]part, 0, len(blocks))
+	var pendingThoughtSignature string
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
@@ -428,32 +410,42 @@ func translateRawContent(raw json.RawMessage, toolNameByID map[string]string) ([
 			if block.ID != "" && block.Name != "" && toolNameByID != nil {
 				toolNameByID[block.ID] = block.Name
 			}
-			out = append(out, part{
+			callPart := part{
 				FunctionCall: &functionCall{
 					Name: block.Name,
 					Args: input,
 				},
-			})
+			}
+			if pendingThoughtSignature != "" {
+				callPart.ThoughtSignature = pendingThoughtSignature
+				pendingThoughtSignature = ""
+			}
+			out = append(out, callPart)
 		case "tool_result":
 			name := toolNameByID[block.ToolUseID]
 			if name == "" {
 				name = "unknown_tool"
 			}
-			content, err := stringifyToolResultContent(block.Content)
+			response, err := translateToolResultResponse(block.Content)
 			if err != nil {
-				return nil, fmt.Errorf("stringify tool_result for %q: %w", block.ToolUseID, err)
+				return nil, fmt.Errorf("translate tool_result for %q: %w", block.ToolUseID, err)
 			}
 			out = append(out, part{
 				FunctionResponse: &functionResponse{
 					ID:   block.ToolUseID,
 					Name: name,
-					Response: map[string]any{
-						"content": content,
-					},
+					Response: response,
 				},
 			})
 		case "thinking":
-			continue
+			out = append(out, part{
+				Text:             block.Text,
+				Thought:          true,
+				ThoughtSignature: block.Signature,
+			})
+			if block.Signature != "" {
+				pendingThoughtSignature = block.Signature
+			}
 		default:
 			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
 		}
@@ -462,40 +454,42 @@ func translateRawContent(raw json.RawMessage, toolNameByID map[string]string) ([
 	return out, nil
 }
 
-func stringifyToolResultContent(raw json.RawMessage) (string, error) {
+func translateToolResultResponse(raw json.RawMessage) (map[string]any, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return "", nil
+		return map[string]any{"content": ""}, nil
 	}
 
 	var text string
 	if err := json.Unmarshal(raw, &text); err == nil {
-		return text, nil
+		return map[string]any{"content": text}, nil
 	}
 
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var blocks []map[string]any
 	if err := json.Unmarshal(raw, &blocks); err == nil {
+		textOnly := true
 		parts := make([]string, 0, len(blocks))
 		for _, block := range blocks {
-			if block.Type == "text" {
-				parts = append(parts, block.Text)
+			if stringValue(block["type"]) != "text" {
+				textOnly = false
+				break
 			}
+			parts = append(parts, stringValue(block["text"]))
 		}
-		return strings.Join(parts, "\n"), nil
+		if textOnly {
+			return map[string]any{"content": strings.Join(parts, "\n")}, nil
+		}
+		return map[string]any{"content": blocks}, nil
 	}
 
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", fmt.Errorf("decode content: %w", err)
+		return nil, fmt.Errorf("decode content: %w", err)
 	}
 
-	buf, err := json.Marshal(value)
-	if err != nil {
-		return "", fmt.Errorf("marshal content: %w", err)
+	if obj, ok := value.(map[string]any); ok {
+		return obj, nil
 	}
-	return string(buf), nil
+	return map[string]any{"content": value}, nil
 }
 
 func convertSchemaTypes(schema map[string]any) map[string]any {
@@ -681,6 +675,109 @@ func mapSchemaType(typeName string) string {
 		return "INTEGER"
 	default:
 		return strings.ToUpper(typeName)
+	}
+}
+
+func parseThinkingRequest(raw json.RawMessage) thinkingRequest {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return thinkingRequest{}
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return thinkingRequest{Enabled: true}
+	}
+
+	req := thinkingRequest{
+		Effort: strings.TrimSpace(stringValue(payload["effort"])),
+		Budget: positiveInt(payload["budget_tokens"]),
+	}
+	if req.Effort == "" {
+		req.Effort = strings.TrimSpace(stringValue(payload["level"]))
+	}
+
+	switch strings.TrimSpace(stringValue(payload["type"])) {
+	case "disabled":
+		return thinkingRequest{}
+	case "adaptive":
+		req.Enabled = true
+		req.Adaptive = true
+		return req
+	case "enabled":
+		req.Enabled = true
+		return req
+	}
+
+	if enabled, ok := payload["enabled"].(bool); ok {
+		req.Enabled = enabled
+		return req
+	}
+
+	req.Enabled = true
+	return req
+}
+
+func buildThinkingConfig(model string, request thinkingRequest, extra map[string]any) *thinkingConfig {
+	cfg := &thinkingConfig{IncludeThoughts: true}
+
+	effort := strings.TrimSpace(request.Effort)
+	if effort == "" {
+		effort = strings.TrimSpace(stringValue(extra["thinking_effort"]))
+	}
+	if effort == "" {
+		effort = strings.TrimSpace(stringValue(extra["reasoning_effort"]))
+	}
+
+	if usesThinkingLevel(model) {
+		if level := mapThinkingLevel(effort); level != "" {
+			cfg.ThinkingLevel = level
+		} else if !request.Adaptive {
+			cfg.ThinkingLevel = "high"
+		}
+		return cfg
+	}
+
+	budget := request.Budget
+	if budget <= 0 {
+		budget = positiveInt(extra["thinking_budget"])
+	}
+	if budget <= 0 && !request.Adaptive {
+		budget = defaultThinkingBudget(effort)
+	}
+	if budget > 0 {
+		cfg.ThinkingBudget = budget
+	}
+	return cfg
+}
+
+func defaultThinkingBudget(effort string) int {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return 1024
+	case "high", "xhigh":
+		return 8192
+	default:
+		return 4096
+	}
+}
+
+func usesThinkingLevel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "gemini-3")
+}
+
+func mapThinkingLevel(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal":
+		return "minimal"
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "xhigh":
+		return "high"
+	default:
+		return ""
 	}
 }
 

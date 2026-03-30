@@ -103,7 +103,7 @@ Content-Type: application/json
 
 #### OpenAI 账号 (`provider: "openai"`)
 
-使用 OpenAI **Responses API** (`/v1/responses`)，网关自动完成 Anthropic ↔ OpenAI 协议翻译。
+使用 OpenAI **Responses API** (`/v1/responses`)，网关为 Claude Code 主链路提供 Anthropic ↔ OpenAI 的 best-effort 协议映射。
 
 ```json
 {
@@ -132,14 +132,16 @@ Content-Type: application/json
   - Anthropic `tool_use`/`tool_result` → OpenAI `function_call`/`function_call_output`
   - Anthropic `thinking` blocks → OpenAI `reasoning`（best-effort 映射）
   - SSE 事件实时翻译：`response.output_text.delta` → `content_block_delta`
+- 默认 `tool_filter` 为透传；仅在显式配置 `strip_mcp` 时过滤 `mcp__*` 工具
+- 当前以 Claude Code 文本、工具调用、thinking 主链路兼容为目标，不承诺 Anthropic 所有内容块都与 OpenAI 完整等价
 - **跨厂商映射**：在 `allowed_models` 中写入 Claude 模型名，`model_aliases` 中配置映射关系
-- `extra` 可选字段：`{"reasoning_effort": "xhigh", "reasoning_summary": "auto"}`，作为 OpenAI 推理模型的账号默认值；支持 `low` / `medium` / `high` / `xhigh`；若请求自带 `thinking` 映射出的 effort，则请求值优先
+- `extra` 可选字段：`{"reasoning_effort": "xhigh", "thinking_summary": "auto", "reasoning_summary": "auto", "tool_filter": "strip_mcp"}`，作为 OpenAI 账号默认值；`reasoning_effort` 仅在请求显式启用 `thinking` 时生效，请求自带 effort/level 提示优先
 
 ---
 
 #### Gemini 账号 (`provider: "gemini"`)
 
-使用 Google Gemini `streamGenerateContent` API，网关自动完成 Anthropic ↔ Gemini 协议翻译。
+使用 Google Gemini `streamGenerateContent` API，网关为 Claude Code 主链路提供 Anthropic ↔ Gemini 的 best-effort 协议映射。
 
 ```json
 {
@@ -164,10 +166,16 @@ Content-Type: application/json
   - Anthropic `user`/`assistant` → Gemini `user`/`model`
   - Anthropic `system` → Gemini `systemInstruction`
   - Anthropic `tool_use`/`tool_result` → Gemini `functionCall`/`functionResponse`
+  - 请求显式启用 `thinking` 时，网关会附带 Gemini `thinkingConfig` 和 `includeThoughts`
+  - Anthropic `thinking.signature` 会映射为 Gemini `thoughtSignature`，并在流式回写时通过 Anthropic thinking block 继续携带
   - JSON Schema 类型名自动转大写：`string` → `STRING`、`object` → `OBJECT` 等
   - Gemini 流式响应为累积快照，网关自动计算增量 delta
+- 默认 `tool_filter` 为透传；仅在显式配置 `strip_mcp` 时过滤 `mcp__*` 工具
+- 当前以 Claude Code 文本、工具调用、thinking 主链路兼容为目标，不承诺 Anthropic 所有内容块都与 Gemini 完整等价
 - `proxy_url`：如果 Gemini API 需要通过代理访问，在此配置
-- `extra` 可选字段：`{"thinking_enabled": true, "thinking_budget": 8192, "safety_settings": {"HARM_CATEGORY_HARASSMENT": "BLOCK_NONE"}}`
+- `extra` 可选字段：`{"thinking_effort": "high", "reasoning_effort": "high", "thinking_budget": 8192, "tool_filter": "strip_mcp", "safety_level": "off", "safety_settings": {"HARM_CATEGORY_HARASSMENT": "BLOCK_NONE"}}`
+  - `thinking_effort` / `reasoning_effort` / `thinking_budget` 仅在请求显式启用 `thinking` 时作为默认值使用
+  - Gemini 2.5 优先使用 `thinkingBudget`，Gemini 3 优先使用 `thinkingLevel`
 
 ---
 

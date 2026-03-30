@@ -2,11 +2,11 @@
 
 `cc-gateway` 是一个面向 Anthropic Messages API 的统一网关。
 
-它对外暴露兼容 Anthropic 的 `POST /v1/messages` 接口，内部可以把请求路由到不同上游账号，并在需要时完成协议翻译：
+它对外暴露兼容 Anthropic 的 `POST /v1/messages` 接口，内部可以把请求路由到不同上游账号，并在需要时完成面向 Claude Code 主链路的 best-effort 协议转换：
 
 - Anthropic -> 原样透传
-- OpenAI -> 转到 `Responses API`
-- Gemini -> 转到 `streamGenerateContent`
+- OpenAI -> 转到 `Responses API`（主链路兼容）
+- Gemini -> 转到 `streamGenerateContent`（主链路兼容）
 - Custom OpenAI / Custom Anthropic -> 对接兼容实现
 
 项目同时内置：
@@ -31,6 +31,7 @@
 - 请求体按 Anthropic Messages API 解析
 - 服务端会强制使用流式模式
 - 支持 `anthropic`、`openai`、`gemini`、`custom_openai`、`custom_anthropic`
+- Anthropic 原生透传；OpenAI / Gemini 以 Claude Code 文本、工具调用、thinking 主链路兼容为目标
 - 支持模型白名单和模型别名映射
 - 支持 `round_robin`、`least_connections`、`weighted`、`priority`
 - 账号级熔断器和并发限制
@@ -52,6 +53,13 @@
 3. 根据 key -> group -> accounts 选择可用上游账号
 4. 按账号类型决定是透传还是做协议翻译
 5. 记录日志、token 用量、成本和指标
+
+兼容边界说明：
+
+- `anthropic` / `custom_anthropic`：按 Anthropic Messages 透传
+- `openai`：面向 Claude Code 主链路做 Anthropic -> Responses best-effort 映射
+- `gemini`：面向 Claude Code 主链路做 Anthropic -> `streamGenerateContent` best-effort 映射
+- 目前不承诺 Anthropic 多模态 / 结构化输出等全部语义在所有上游都完整等价
 
 配置来源分两类：
 

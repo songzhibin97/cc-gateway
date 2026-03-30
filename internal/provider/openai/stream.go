@@ -93,6 +93,14 @@ type responseReasoningSummaryPartAddedEvent struct {
 	SummaryIndex int    `json:"summary_index"`
 }
 
+// responseReasoningSummaryPartDoneEvent represents the
+// response.reasoning_summary_part.done SSE event.
+type responseReasoningSummaryPartDoneEvent struct {
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	SummaryIndex int    `json:"summary_index"`
+}
+
 // responseReasoningSummaryTextDeltaEvent represents the
 // response.reasoning_summary_text.delta SSE event.
 type responseReasoningSummaryTextDeltaEvent struct {
@@ -396,7 +404,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 
 	case "response.reasoning_summary_part.done":
 		// Part done — ensure block is closed if not already.
-		var evt responseReasoningSummaryPartAddedEvent // same shape
+		var evt responseReasoningSummaryPartDoneEvent
 		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
 			return nil, c.usage, nil
 		}
