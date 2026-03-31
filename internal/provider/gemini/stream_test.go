@@ -145,6 +145,175 @@ func TestStreamConverterTextSnapshotsEmitStableDeltas(t *testing.T) {
 	}
 }
 
+func TestStreamConverterThinkingSnapshotsEmitIncrementalDeltas(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514", nil)
+
+	raw1, _, err := converter.ProcessResponse(&generateContentResponse{
+		Candidates: []candidate{
+			{
+				Content: content{
+					Parts: []part{
+						{
+							Text:    "hel",
+							Thought: true,
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProcessResponse first snapshot returned error: %v", err)
+	}
+
+	raw2, _, err := converter.ProcessResponse(&generateContentResponse{
+		Candidates: []candidate{
+			{
+				Content: content{
+					Parts: []part{
+						{
+							Text:             "hello",
+							Thought:          true,
+							ThoughtSignature: "sig_123",
+						},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProcessResponse second snapshot returned error: %v", err)
+	}
+
+	events := decodeGeminiAnthropicSSE(t, append(raw1, raw2...))
+	assertGeminiEventTypes(t, events, []string{
+		"message_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_delta",
+		"content_block_delta",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	})
+
+	var first struct {
+		Delta struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[2].Data), &first); err != nil {
+		t.Fatalf("decode first thinking delta: %v", err)
+	}
+	if first.Delta.Type != "thinking_delta" || first.Delta.Thinking != "hel" {
+		t.Fatalf("unexpected first thinking delta: %+v", first.Delta)
+	}
+
+	var second struct {
+		Delta struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[3].Data), &second); err != nil {
+		t.Fatalf("decode second thinking delta: %v", err)
+	}
+	if second.Delta.Type != "thinking_delta" || second.Delta.Thinking != "lo" {
+		t.Fatalf("unexpected second thinking delta: %+v", second.Delta)
+	}
+
+	var signature struct {
+		Delta struct {
+			Type      string `json:"type"`
+			Signature string `json:"signature"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &signature); err != nil {
+		t.Fatalf("decode thinking signature delta: %v", err)
+	}
+	if signature.Delta.Type != "signature_delta" || signature.Delta.Signature != "sig_123" {
+		t.Fatalf("unexpected thinking signature delta: %+v", signature.Delta)
+	}
+}
+
+func TestStreamConverterThinkingSignatureDoesNotRepeatAcrossSnapshots(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514", nil)
+
+	raw1, _, err := converter.ProcessResponse(&generateContentResponse{
+		Candidates: []candidate{
+			{
+				Content: content{
+					Parts: []part{
+						{
+							Text:             "plan",
+							Thought:          true,
+							ThoughtSignature: "sig_123",
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProcessResponse first snapshot returned error: %v", err)
+	}
+
+	raw2, _, err := converter.ProcessResponse(&generateContentResponse{
+		Candidates: []candidate{
+			{
+				Content: content{
+					Parts: []part{
+						{
+							Text:             "plan more",
+							Thought:          true,
+							ThoughtSignature: "sig_123",
+						},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ProcessResponse second snapshot returned error: %v", err)
+	}
+
+	events := decodeGeminiAnthropicSSE(t, append(raw1, raw2...))
+	assertGeminiEventTypes(t, events, []string{
+		"message_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_delta",
+		"content_block_delta",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	})
+
+	var signatureDeltas int
+	for _, event := range events {
+		if event.Type != "content_block_delta" {
+			continue
+		}
+		var payload struct {
+			Delta struct {
+				Type string `json:"type"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			t.Fatalf("decode delta event: %v", err)
+		}
+		if payload.Delta.Type == "signature_delta" {
+			signatureDeltas++
+		}
+	}
+	if signatureDeltas != 1 {
+		t.Fatalf("expected one signature delta across snapshots, got %d", signatureDeltas)
+	}
+}
+
 func TestStreamConverterFunctionCallSnapshotsEmitStableDeltas(t *testing.T) {
 	converter := NewStreamConverter("claude-sonnet-4-20250514", nil)
 

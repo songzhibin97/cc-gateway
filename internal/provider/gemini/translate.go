@@ -62,18 +62,20 @@ type functionDeclaration struct {
 }
 
 type generationConfig struct {
-	MaxOutputTokens int             `json:"maxOutputTokens,omitempty"`
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"topP,omitempty"`
-	TopK            *int            `json:"topK,omitempty"`
-	StopSequences   []string        `json:"stopSequences,omitempty"`
-	ThinkingConfig  *thinkingConfig `json:"thinkingConfig,omitempty"`
+	MaxOutputTokens    int             `json:"maxOutputTokens,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"topP,omitempty"`
+	TopK               *int            `json:"topK,omitempty"`
+	StopSequences      []string        `json:"stopSequences,omitempty"`
+	ThinkingConfig     *thinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseMimeType   string          `json:"responseMimeType,omitempty"`
+	ResponseJsonSchema any             `json:"responseJsonSchema,omitempty"`
 }
 
 type thinkingConfig struct {
-	ThinkingBudget int    `json:"thinkingBudget,omitempty"`
-	ThinkingLevel  string `json:"thinkingLevel,omitempty"`
-	IncludeThoughts bool  `json:"includeThoughts,omitempty"`
+	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
+	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
 }
 
 type safetySetting struct {
@@ -88,21 +90,30 @@ type anthropicTool struct {
 }
 
 type anthropicContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Signature string          `json:"signature,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
+	Type          string          `json:"type"`
+	Text          string          `json:"text,omitempty"`
+	Data          string          `json:"data,omitempty"`
+	ConnectorText string          `json:"connector_text,omitempty"`
+	Signature     string          `json:"signature,omitempty"`
+	ID            string          `json:"id,omitempty"`
+	Name          string          `json:"name,omitempty"`
+	Input         json.RawMessage `json:"input,omitempty"`
+	ToolUseID     string          `json:"tool_use_id,omitempty"`
+	Content       json.RawMessage `json:"content,omitempty"`
+}
+
+type outputConfigHints struct {
+	ResponseMimeType string
+	ResponseSchema   any
+	ThinkingEffort   string
+	TaskBudget       int
 }
 
 type thinkingRequest struct {
-	Enabled bool
+	Enabled  bool
 	Adaptive bool
-	Effort  string
-	Budget  int
+	Effort   string
+	Budget   int
 }
 
 // ToolSchema holds allowed parameter names and required fields for a tool.
@@ -153,6 +164,7 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*gene
 	out := &generateContentRequest{
 		Contents: make([]content, 0, len(req.Messages)),
 	}
+	outputHints := parseOutputConfig(req.OutputConfig)
 
 	if len(bytes.TrimSpace(req.System)) != 0 {
 		parts, err := translateRawContent(req.System, nil)
@@ -221,11 +233,32 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*gene
 	if len(req.StopSequences) > 0 {
 		cfg.StopSequences = req.StopSequences
 	}
-	// thinking 仅在请求明确要求时启用（Gemini 2.5+, Gemini 3+）。
-	if thinking := parseThinkingRequest(req.Thinking); thinking.Enabled && modelSupportsThinking(req.Model) {
-		cfg.ThinkingConfig = buildThinkingConfig(req.Model, thinking, extra)
+	thinkingReq := parseThinkingRequest(req.Thinking)
+	if outputHints.ThinkingEffort != "" {
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra = cloneStringMap(extra)
+		extra["thinking_effort"] = outputHints.ThinkingEffort
+		thinkingReq.Enabled = true
+	}
+	// thinking 在请求显式开启，或 output_config.effort 需要时启用（Gemini 2.5+, Gemini 3+）。
+	if thinkingReq.Enabled && modelSupportsThinking(req.Model) {
+		cfg.ThinkingConfig = buildThinkingConfig(req.Model, thinkingReq, extra)
+	}
+	if outputHints.ResponseMimeType != "" {
+		cfg.ResponseMimeType = outputHints.ResponseMimeType
+		cfg.ResponseJsonSchema = outputHints.ResponseSchema
+	}
+	if outputHints.TaskBudget > 0 {
+		if cfg.MaxOutputTokens == 0 || outputHints.TaskBudget < cfg.MaxOutputTokens {
+			cfg.MaxOutputTokens = outputHints.TaskBudget
+		}
 	}
 	if cfg.MaxOutputTokens > 0 || cfg.Temperature != nil || cfg.TopP != nil || cfg.TopK != nil || len(cfg.StopSequences) > 0 || cfg.ThinkingConfig != nil {
+		out.GenerationConfig = cfg
+	}
+	if outputHints.ResponseMimeType != "" && out.GenerationConfig == nil {
 		out.GenerationConfig = cfg
 	}
 	// safety: 优先 extra 配置，否则默认 "off"（BLOCK_NONE，API 调用无需内容过滤）
@@ -400,6 +433,39 @@ func translateRawContent(raw json.RawMessage, toolNameByID map[string]string) ([
 		switch block.Type {
 		case "text":
 			out = append(out, part{Text: block.Text})
+		case "thinking":
+			out = append(out, part{
+				Text:             block.Text,
+				Thought:          true,
+				ThoughtSignature: block.Signature,
+			})
+			if block.Signature != "" {
+				pendingThoughtSignature = block.Signature
+			}
+		case "redacted_thinking":
+			out = append(out, part{
+				Text:             "",
+				Thought:          true,
+				ThoughtSignature: block.Signature,
+			})
+			if block.Signature != "" {
+				pendingThoughtSignature = block.Signature
+			}
+		case "connector_text":
+			connectorText := block.ConnectorText
+			if connectorText == "" {
+				connectorText = block.Text
+			}
+			if connectorText == "" {
+				connectorText = stringifyBlock(block)
+			}
+			out = append(out, part{
+				Text:             connectorText,
+				ThoughtSignature: block.Signature,
+			})
+			if block.Signature != "" {
+				pendingThoughtSignature = block.Signature
+			}
 		case "tool_use":
 			var input any
 			if len(bytes.TrimSpace(block.Input)) != 0 {
@@ -421,75 +487,309 @@ func translateRawContent(raw json.RawMessage, toolNameByID map[string]string) ([
 				pendingThoughtSignature = ""
 			}
 			out = append(out, callPart)
-		case "tool_result":
-			name := toolNameByID[block.ToolUseID]
-			if name == "" {
-				name = "unknown_tool"
+		case "server_tool_use", "mcp_tool_use":
+			callPart, hasCall := translateToolUseBlock(block)
+			if hasCall {
+				if block.ID != "" && callPart.FunctionCall != nil && callPart.FunctionCall.Name != "" && toolNameByID != nil {
+					toolNameByID[block.ID] = callPart.FunctionCall.Name
+				}
+				if callPart.ThoughtSignature == "" && pendingThoughtSignature != "" {
+					callPart.ThoughtSignature = pendingThoughtSignature
+					pendingThoughtSignature = ""
+				}
+				out = append(out, callPart)
+				break
 			}
-			response, err := translateToolResultResponse(block.Content)
-			if err != nil {
-				return nil, fmt.Errorf("translate tool_result for %q: %w", block.ToolUseID, err)
+			fallthrough
+		case "tool_result", "web_search_tool_result", "mcp_tool_result", "code_execution_tool_result", "web_fetch_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result", "tool_search_tool_result", "compaction", "container_upload":
+			if responsePart, hasResponse := translateToolResultBlock(block, toolNameByID); hasResponse {
+				out = append(out, responsePart)
+				break
 			}
-			out = append(out, part{
-				FunctionResponse: &functionResponse{
-					ID:   block.ToolUseID,
-					Name: name,
-					Response: response,
-				},
-			})
-		case "thinking":
-			out = append(out, part{
-				Text:             block.Text,
-				Thought:          true,
-				ThoughtSignature: block.Signature,
-			})
-			if block.Signature != "" {
-				pendingThoughtSignature = block.Signature
-			}
+			out = append(out, part{Text: stringifyBlock(block)})
 		default:
-			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
+			out = append(out, part{Text: stringifyBlock(block)})
 		}
 	}
 
 	return out, nil
 }
 
-func translateToolResultResponse(raw json.RawMessage) (map[string]any, error) {
-	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+func translateToolUseBlock(block anthropicContentBlock) (part, bool) {
+	name := firstString(block.Name, stringValue(anyValue(block.Input)["name"]))
+	if name == "" {
+		name = firstString(stringValue(anyValue(block.Content)["name"]), block.Type)
+	}
+
+	var args any
+	switch {
+	case len(bytes.TrimSpace(block.Input)) != 0:
+		if err := json.Unmarshal(block.Input, &args); err == nil {
+			break
+		}
+		args = string(block.Input)
+	case len(bytes.TrimSpace(block.Content)) != 0:
+		if err := json.Unmarshal(block.Content, &args); err == nil {
+			break
+		}
+		args = string(block.Content)
+	default:
+		args = map[string]any{}
+	}
+
+	if name == "" && isEmptyJSONValue(args) {
+		return part{}, false
+	}
+
+	return part{
+		FunctionCall: &functionCall{
+			Name: name,
+			Args: args,
+		},
+	}, true
+}
+
+func translateToolResultBlock(block anthropicContentBlock, toolNameByID map[string]string) (part, bool) {
+	toolUseID := firstString(block.ToolUseID, block.ID)
+	name := ""
+	if toolNameByID != nil && toolUseID != "" {
+		name = toolNameByID[toolUseID]
+	}
+	if name == "" {
+		name = firstString(block.Name, block.Type)
+	}
+
+	var content any
+	switch {
+	case len(bytes.TrimSpace(block.Content)) != 0:
+		if err := json.Unmarshal(block.Content, &content); err != nil {
+			content = string(block.Content)
+		}
+	case len(bytes.TrimSpace(block.Input)) != 0:
+		if err := json.Unmarshal(block.Input, &content); err != nil {
+			content = string(block.Input)
+		}
+	default:
+		return part{}, false
+	}
+
+	response, err := translateToolResultResponse(content)
+	if err != nil {
+		return part{}, false
+	}
+
+	return part{
+		FunctionResponse: &functionResponse{
+			ID:       toolUseID,
+			Name:     name,
+			Response: response,
+		},
+	}, true
+}
+
+func stringifyBlock(block anthropicContentBlock) string {
+	switch {
+	case block.Text != "":
+		return block.Text
+	case block.Data != "":
+		return block.Data
+	case block.ConnectorText != "":
+		return block.ConnectorText
+	}
+
+	if len(bytes.TrimSpace(block.Content)) != 0 {
+		return string(block.Content)
+	}
+	if len(bytes.TrimSpace(block.Input)) != 0 {
+		return string(block.Input)
+	}
+	return mustJSONString(block)
+}
+
+func mustJSONString(v any) string {
+	buf, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(buf)
+}
+
+func firstString(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func isEmptyJSONValue(v any) bool {
+	switch value := v.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		return len(value) == 0
+	case []any:
+		return len(value) == 0
+	case string:
+		return strings.TrimSpace(value) == ""
+	}
+	return false
+}
+
+func anyValue(raw json.RawMessage) map[string]any {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func translateToolResultResponse(content any) (map[string]any, error) {
+	switch v := content.(type) {
+	case nil:
 		return map[string]any{"content": ""}, nil
-	}
-
-	var text string
-	if err := json.Unmarshal(raw, &text); err == nil {
-		return map[string]any{"content": text}, nil
-	}
-
-	var blocks []map[string]any
-	if err := json.Unmarshal(raw, &blocks); err == nil {
-		textOnly := true
-		parts := make([]string, 0, len(blocks))
-		for _, block := range blocks {
-			if stringValue(block["type"]) != "text" {
-				textOnly = false
-				break
-			}
-			parts = append(parts, stringValue(block["text"]))
+	case string:
+		return map[string]any{"content": v}, nil
+	case json.RawMessage:
+		if len(bytes.TrimSpace(v)) == 0 || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+			return map[string]any{"content": ""}, nil
 		}
-		if textOnly {
-			return map[string]any{"content": strings.Join(parts, "\n")}, nil
+
+		var text string
+		if err := json.Unmarshal(v, &text); err == nil {
+			return map[string]any{"content": text}, nil
 		}
-		return map[string]any{"content": blocks}, nil
+
+		var blocks []map[string]any
+		if err := json.Unmarshal(v, &blocks); err == nil {
+			return collapseToolResultBlocks(blocks), nil
+		}
+
+		var value any
+		if err := json.Unmarshal(v, &value); err != nil {
+			return nil, fmt.Errorf("decode content: %w", err)
+		}
+		return normalizeToolResultValue(value), nil
+	case []any:
+		if len(v) == 0 {
+			return map[string]any{"content": []any{}}, nil
+		}
+		if blocks, ok := normalizeToolResultBlocks(v); ok {
+			return collapseToolResultBlocks(blocks), nil
+		}
+		return map[string]any{"content": v}, nil
+	case map[string]any:
+		return v, nil
+	default:
+		buf, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal content: %w", err)
+		}
+		return map[string]any{"content": json.RawMessage(buf)}, nil
+	}
+}
+
+func collapseToolResultBlocks(blocks []map[string]any) map[string]any {
+	textOnly := true
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if stringValue(block["type"]) != "text" {
+			textOnly = false
+			break
+		}
+		parts = append(parts, stringValue(block["text"]))
+	}
+	if textOnly {
+		return map[string]any{"content": strings.Join(parts, "\n")}
+	}
+	items := make([]any, 0, len(blocks))
+	for _, block := range blocks {
+		items = append(items, block)
+	}
+	return map[string]any{"content": items}
+}
+
+func normalizeToolResultBlocks(items []any) ([]map[string]any, bool) {
+	blocks := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		block, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		blocks = append(blocks, block)
+	}
+	return blocks, true
+}
+
+func normalizeToolResultValue(v any) map[string]any {
+	if obj, ok := v.(map[string]any); ok {
+		return obj
+	}
+	return map[string]any{"content": v}
+}
+
+func cloneStringMap(src map[string]any) map[string]any {
+	if src == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func parseOutputConfig(raw json.RawMessage) outputConfigHints {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return outputConfigHints{}
 	}
 
-	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, fmt.Errorf("decode content: %w", err)
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return outputConfigHints{}
 	}
 
-	if obj, ok := value.(map[string]any); ok {
-		return obj, nil
+	hints := outputConfigHints{}
+	if effort := strings.TrimSpace(stringValue(cfg["effort"])); effort != "" {
+		hints.ThinkingEffort = effort
 	}
-	return map[string]any{"content": value}, nil
+
+	if taskBudget, ok := cfg["task_budget"].(map[string]any); ok {
+		hints.TaskBudget = positiveInt(taskBudget["remaining"])
+		if hints.TaskBudget <= 0 {
+			hints.TaskBudget = positiveInt(taskBudget["total"])
+		}
+	} else {
+		hints.TaskBudget = positiveInt(cfg["task_budget"])
+	}
+
+	format, ok := cfg["format"].(map[string]any)
+	if !ok {
+		return hints
+	}
+	if formatType := strings.ToLower(strings.TrimSpace(stringValue(format["type"]))); formatType != "json_schema" && formatType != "json_object" && formatType != "json" {
+		return hints
+	}
+
+	hints.ResponseMimeType = "application/json"
+	var schema any
+	if js, ok := format["json_schema"].(map[string]any); ok {
+		schema = js["schema"]
+		if schema == nil {
+			schema = js
+		}
+	}
+	if schema == nil {
+		schema = format["schema"]
+	}
+	if schema != nil {
+		hints.ResponseSchema = schema
+	}
+	return hints
 }
 
 func convertSchemaTypes(schema map[string]any) map[string]any {

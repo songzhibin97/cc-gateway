@@ -36,6 +36,13 @@ type toolStreamState struct {
 	Open         bool
 }
 
+type thoughtStreamState struct {
+	Index             int
+	PreviousText      string
+	PreviousSignature string
+	Open              bool
+}
+
 type StreamConverter struct {
 	model                 string
 	toolSchemas           map[string]*ToolSchema
@@ -47,6 +54,7 @@ type StreamConverter struct {
 	textIndex             int
 	textBlockOpen         bool
 	previousText          string
+	thoughtStates         map[string]*thoughtStreamState
 	toolStates            map[string]*toolStreamState
 	sawFunctionCall       bool
 	usage                 *domain.Usage
@@ -54,12 +62,13 @@ type StreamConverter struct {
 
 func NewStreamConverter(model string, toolSchemas map[string]*ToolSchema) *StreamConverter {
 	return &StreamConverter{
-		model:       model,
-		toolSchemas: toolSchemas,
-		messageID:   fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		textIndex:   -1,
-		toolStates:  make(map[string]*toolStreamState),
-		usage:       &domain.Usage{},
+		model:         model,
+		toolSchemas:   toolSchemas,
+		messageID:     fmt.Sprintf("msg_%d", time.Now().UnixNano()),
+		textIndex:     -1,
+		thoughtStates: make(map[string]*thoughtStreamState),
+		toolStates:    make(map[string]*toolStreamState),
+		usage:         &domain.Usage{},
 	}
 }
 
@@ -85,8 +94,8 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 				"usage": map[string]any{
 					"input_tokens":                c.usage.InputTokens,
 					"output_tokens":               c.usage.OutputTokens,
-					"cache_creation_input_tokens":  0,
-					"cache_read_input_tokens":      0,
+					"cache_creation_input_tokens": 0,
+					"cache_read_input_tokens":     0,
 				},
 			},
 		})
@@ -104,26 +113,23 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 	for i, p := range candidate.Content.Parts {
 		switch {
 		case p.Thought:
-			thinkIndex := c.nextIndex
-			c.nextIndex++
-			raw, err := formatAnthropicEvent("content_block_start", map[string]any{
-				"index": thinkIndex,
-				"content_block": map[string]any{
-					"type":     "thinking",
-					"thinking": "",
-				},
-			})
-			if err != nil {
-				return nil, c.usage, err
+			key := fmt.Sprintf("part_%d", i)
+			state := c.thoughtStates[key]
+			if state == nil {
+				state = &thoughtStreamState{
+					Index: c.nextIndex,
+				}
+				c.thoughtStates[key] = state
+				c.nextIndex++
 			}
-			payloads = append(payloads, raw)
 
-			if p.Text != "" {
-				raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
-					"index": thinkIndex,
-					"delta": map[string]any{
-						"type":     "thinking_delta",
-						"thinking": p.Text,
+			if !state.Open {
+				state.Open = true
+				raw, err := formatAnthropicEvent("content_block_start", map[string]any{
+					"index": state.Index,
+					"content_block": map[string]any{
+						"type":     "thinking",
+						"thinking": "",
 					},
 				})
 				if err != nil {
@@ -132,9 +138,23 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 				payloads = append(payloads, raw)
 			}
 
-			if p.ThoughtSignature != "" {
-				raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
-					"index": thinkIndex,
+			if delta := computeStreamDelta(p.Text, &state.PreviousText); delta != "" {
+				raw, err := formatAnthropicEvent("content_block_delta", map[string]any{
+					"index": state.Index,
+					"delta": map[string]any{
+						"type":     "thinking_delta",
+						"thinking": delta,
+					},
+				})
+				if err != nil {
+					return nil, c.usage, err
+				}
+				payloads = append(payloads, raw)
+			}
+
+			if p.ThoughtSignature != "" && p.ThoughtSignature != state.PreviousSignature {
+				raw, err := formatAnthropicEvent("content_block_delta", map[string]any{
+					"index": state.Index,
 					"delta": map[string]any{
 						"type":      "signature_delta",
 						"signature": p.ThoughtSignature,
@@ -143,17 +163,9 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 				if err != nil {
 					return nil, c.usage, err
 				}
+				state.PreviousSignature = p.ThoughtSignature
 				payloads = append(payloads, raw)
 			}
-
-			raw, err = formatAnthropicEvent("content_block_stop", map[string]any{
-				"index": thinkIndex,
-			})
-			if err != nil {
-				return nil, c.usage, err
-			}
-			c.contentBlockCompleted = true
-			payloads = append(payloads, raw)
 
 		case p.Text != "":
 			if !c.textBlockOpen {
@@ -279,8 +291,8 @@ func (c *StreamConverter) ProcessResponse(resp *generateContentResponse) ([][]by
 			"usage": map[string]any{
 				"input_tokens":                c.usage.InputTokens,
 				"output_tokens":               c.usage.OutputTokens,
-				"cache_creation_input_tokens":  0,
-				"cache_read_input_tokens":      0,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens":     0,
 			},
 		})
 		if err != nil {
@@ -328,8 +340,8 @@ func (c *StreamConverter) Finalize() [][]byte {
 		"usage": map[string]any{
 			"input_tokens":                c.usage.InputTokens,
 			"output_tokens":               c.usage.OutputTokens,
-			"cache_creation_input_tokens":  0,
-			"cache_read_input_tokens":      0,
+			"cache_creation_input_tokens": 0,
+			"cache_read_input_tokens":     0,
 		},
 	})
 	if err == nil {
@@ -398,6 +410,29 @@ func (c *StreamConverter) closeOpenBlocks() ([][]byte, error) {
 		}
 		payloads = append(payloads, raw)
 		c.textBlockOpen = false
+		c.contentBlockCompleted = true
+	}
+
+	thoughtKeys := make([]string, 0, len(c.thoughtStates))
+	for key, state := range c.thoughtStates {
+		if state.Open {
+			thoughtKeys = append(thoughtKeys, key)
+		}
+	}
+	sort.Slice(thoughtKeys, func(i, j int) bool {
+		return c.thoughtStates[thoughtKeys[i]].Index < c.thoughtStates[thoughtKeys[j]].Index
+	})
+
+	for _, key := range thoughtKeys {
+		state := c.thoughtStates[key]
+		raw, err := formatAnthropicEvent("content_block_stop", map[string]any{
+			"index": state.Index,
+		})
+		if err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, raw)
+		state.Open = false
 		c.contentBlockCompleted = true
 	}
 

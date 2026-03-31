@@ -101,8 +101,16 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 	if len(req.ToolChoice) > 0 {
 		out.ToolChoice = translateToolChoice(req.ToolChoice)
 	}
-	// output_config 不翻译 — 多数第三方代理不支持 text/json_schema，
-	// 模型可通过 system prompt 指令生成有效 JSON。
+	if outputConfig := translateOutputConfig(req.OutputConfig); outputConfig != nil {
+		if outputConfig.text != nil {
+			out.Text = map[string]any{
+				"format": outputConfig.text,
+			}
+		}
+		if outputConfig.maxOutputTokens > 0 && (out.MaxOutputTokens == 0 || outputConfig.maxOutputTokens < out.MaxOutputTokens) {
+			out.MaxOutputTokens = outputConfig.maxOutputTokens
+		}
+	}
 	if len(req.StopSequences) > 0 {
 		out.Stop = req.StopSequences
 	}
@@ -220,6 +228,8 @@ func translateMessage(msg domain.Message) ([]any, error) {
 func translateContentBlocks(role string, blocks []map[string]any) ([]any, error) {
 	var out []any
 	var textBlocks []map[string]any
+	var reasoningBlocks []map[string]any
+	reasoningIndex := 0
 
 	flushText := func() {
 		if len(textBlocks) == 0 {
@@ -232,9 +242,19 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 		textBlocks = nil
 	}
 
+	flushReasoning := func() {
+		if len(reasoningBlocks) == 0 {
+			return
+		}
+		out = append(out, buildReasoningItem(reasoningBlocks, reasoningIndex))
+		reasoningIndex++
+		reasoningBlocks = nil
+	}
+
 	for _, block := range blocks {
-		switch stringValue(block["type"]) {
+		switch blockType := stringValue(block["type"]); blockType {
 		case "text":
+			flushReasoning()
 			partType := "input_text"
 			if role == "assistant" {
 				partType = "output_text"
@@ -243,40 +263,69 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 				"type": partType,
 				"text": stringValue(block["text"]),
 			})
+		case "connector_text":
+			flushReasoning()
+			partType := "input_text"
+			if role == "assistant" {
+				partType = "output_text"
+			}
+			text := stringValue(block["connector_text"])
+			if text == "" {
+				text = stringValue(block["text"])
+			}
+			textBlocks = append(textBlocks, map[string]any{
+				"type": partType,
+				"text": text,
+			})
+		case "image":
+			flushReasoning()
+			if contentBlock, ok := translateImageContentBlock(block); ok {
+				textBlocks = append(textBlocks, contentBlock)
+				continue
+			}
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
+		case "document":
+			flushReasoning()
+			if contentBlock, ok := translateDocumentContentBlock(block); ok {
+				textBlocks = append(textBlocks, contentBlock)
+				continue
+			}
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "tool_use":
-			if role != "assistant" {
-				return nil, fmt.Errorf("tool_use block requires assistant role, got %q", role)
-			}
 			flushText()
-			inputJSON, err := json.Marshal(block["input"])
-			if err != nil {
-				return nil, fmt.Errorf("marshal tool_use input: %w", err)
+			flushReasoning()
+			if item, ok := translateFunctionCallItem(block, blockType); ok {
+				out = append(out, item)
+				continue
 			}
-			out = append(out, map[string]any{
-				"type":      "function_call",
-				"call_id":   stringValue(block["id"]),
-				"name":      stringValue(block["name"]),
-				"arguments": string(inputJSON),
-			})
-		case "tool_result":
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
+		case "server_tool_use", "mcp_tool_use":
 			flushText()
-			output, err := stringifyToolResultContent(block["content"])
-			if err != nil {
-				return nil, err
+			flushReasoning()
+			if item, ok := translateFunctionCallItem(block, blockType); ok {
+				out = append(out, item)
+				continue
 			}
-			out = append(out, map[string]any{
-				"type":    "function_call_output",
-				"call_id": stringValue(block["tool_use_id"]),
-				"output":  output,
-			})
-		case "thinking":
-			continue
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
+		case "tool_result", "web_search_tool_result", "mcp_tool_result", "code_execution_tool_result", "web_fetch_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result", "tool_search_tool_result":
+			flushText()
+			flushReasoning()
+			if item, ok := translateFunctionCallOutputItem(block); ok {
+				out = append(out, item)
+				continue
+			}
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
+		case "thinking", "redacted_thinking":
+			flushText()
+			reasoningBlocks = append(reasoningBlocks, block)
 		default:
-			return nil, fmt.Errorf("unsupported content block type %q", stringValue(block["type"]))
+			flushReasoning()
+			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		}
 	}
 
 	flushText()
+	flushReasoning()
 	return out, nil
 }
 
@@ -287,17 +336,24 @@ func stringifyToolResultContent(content any) (string, error) {
 	case string:
 		return v, nil
 	case []any:
+		textOnly := true
 		parts := make([]string, 0, len(v))
 		for _, item := range v {
 			block, ok := item.(map[string]any)
-			if !ok {
-				return "", fmt.Errorf("unsupported tool_result content item %T", item)
+			if !ok || stringValue(block["type"]) != "text" {
+				textOnly = false
+				break
 			}
-			if stringValue(block["type"]) == "text" {
-				parts = append(parts, stringValue(block["text"]))
-			}
+			parts = append(parts, stringValue(block["text"]))
 		}
-		return strings.Join(parts, "\n"), nil
+		if textOnly {
+			return strings.Join(parts, "\n"), nil
+		}
+		buf, err := json.Marshal(v)
+		if err != nil {
+			return "", fmt.Errorf("marshal tool_result content: %w", err)
+		}
+		return string(buf), nil
 	default:
 		buf, err := json.Marshal(content)
 		if err != nil {
@@ -305,6 +361,222 @@ func stringifyToolResultContent(content any) (string, error) {
 		}
 		return string(buf), nil
 	}
+}
+
+func partTypeForRole(role string) string {
+	if role == "assistant" {
+		return "output_text"
+	}
+	return "input_text"
+}
+
+func fallbackTextContentBlock(role string, block map[string]any) map[string]any {
+	text := stringifyBlock(block)
+	if text == "" {
+		text = stringValue(block["text"])
+	}
+	return map[string]any{
+		"type": partTypeForRole(role),
+		"text": text,
+	}
+}
+
+func translateImageContentBlock(block map[string]any) (map[string]any, bool) {
+	source, ok := asMap(block["source"])
+	if !ok {
+		return nil, false
+	}
+
+	switch stringValue(source["type"]) {
+	case "base64":
+		data := stringValue(source["data"])
+		if data == "" {
+			return nil, false
+		}
+		mediaType := stringValue(source["media_type"])
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		return map[string]any{
+			"type":      "input_image",
+			"detail":    "auto",
+			"image_url": "data:" + mediaType + ";base64," + data,
+		}, true
+	case "url":
+		imageURL := stringValue(source["image_url"])
+		if imageURL == "" {
+			imageURL = stringValue(source["url"])
+		}
+		if imageURL == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type":      "input_image",
+			"detail":    "auto",
+			"image_url": imageURL,
+		}, true
+	}
+
+	return nil, false
+}
+
+func translateDocumentContentBlock(block map[string]any) (map[string]any, bool) {
+	source, ok := asMap(block["source"])
+	if !ok {
+		return nil, false
+	}
+
+	item := map[string]any{
+		"type": "input_file",
+	}
+	added := false
+
+	if data := stringValue(source["data"]); data != "" {
+		item["file_data"] = data
+		added = true
+	}
+	if fileURL := stringValue(source["file_url"]); fileURL != "" {
+		item["file_url"] = fileURL
+		added = true
+	}
+	if fileID := stringValue(source["file_id"]); fileID != "" {
+		item["file_id"] = fileID
+		added = true
+	}
+	if filename := stringValue(source["filename"]); filename != "" {
+		item["filename"] = filename
+		added = true
+	}
+	if !added {
+		return nil, false
+	}
+	return item, true
+}
+
+func translateFunctionCallItem(block map[string]any, blockType string) (map[string]any, bool) {
+	name := stringValue(block["name"])
+	if name == "" {
+		return nil, false
+	}
+
+	callID := firstNonEmpty(
+		stringValue(block["call_id"]),
+		stringValue(block["tool_use_id"]),
+		stringValue(block["id"]),
+		name,
+		blockType,
+	)
+	arguments, err := json.Marshal(firstNonNil(block["input"], block["arguments"], map[string]any{}))
+	if err != nil {
+		return nil, false
+	}
+
+	item := map[string]any{
+		"type":      "function_call",
+		"id":        callID,
+		"call_id":   callID,
+		"name":      name,
+		"arguments": string(arguments),
+	}
+	return item, true
+}
+
+func translateFunctionCallOutputItem(block map[string]any) (map[string]any, bool) {
+	callID := firstNonEmpty(
+		stringValue(block["tool_use_id"]),
+		stringValue(block["call_id"]),
+		stringValue(block["id"]),
+	)
+	if callID == "" {
+		return nil, false
+	}
+
+	output, err := stringifyToolResultContent(firstNonNil(block["content"], block["output"], block["result"]))
+	if err != nil {
+		return nil, false
+	}
+
+	return map[string]any{
+		"type":    "function_call_output",
+		"id":      callID,
+		"call_id": callID,
+		"output":  output,
+	}, true
+}
+
+func buildReasoningItem(blocks []map[string]any, index int) map[string]any {
+	summaries := make([]map[string]any, 0, len(blocks))
+	encryptedContent := ""
+
+	for _, block := range blocks {
+		summaryText := reasoningSummaryText(block)
+		summaries = append(summaries, map[string]any{
+			"type": "summary_text",
+			"text": summaryText,
+		})
+
+		if encryptedContent == "" && stringValue(block["type"]) == "redacted_thinking" {
+			if raw := stringValue(block["encrypted_content"]); raw != "" {
+				encryptedContent = raw
+			} else {
+				encryptedContent = stringifyBlock(block)
+			}
+		}
+	}
+
+	item := map[string]any{
+		"type":    "reasoning",
+		"id":      fmt.Sprintf("reasoning_%d", index),
+		"status":  "completed",
+		"summary": summaries,
+	}
+	if encryptedContent != "" {
+		item["encrypted_content"] = encryptedContent
+	}
+	return item
+}
+
+func reasoningSummaryText(block map[string]any) string {
+	for _, key := range []string{"text", "thinking", "connector_text", "summary"} {
+		if text := strings.TrimSpace(stringValue(block[key])); text != "" {
+			return text
+		}
+	}
+	if stringValue(block["type"]) == "redacted_thinking" {
+		return "[redacted_thinking]"
+	}
+	return stringifyBlock(block)
+}
+
+func stringifyBlock(block map[string]any) string {
+	buf, err := json.Marshal(block)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+func asMap(v any) (map[string]any, bool) {
+	m, ok := v.(map[string]any)
+	return m, ok
+}
+
+func firstNonNil(values ...any) any {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func translateReasoning(raw json.RawMessage) reasoningState {
@@ -366,6 +638,40 @@ func stringValue(v any) string {
 	return s
 }
 
+func positiveInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		if n > 0 {
+			return n
+		}
+	case int8:
+		if n > 0 {
+			return int(n)
+		}
+	case int16:
+		if n > 0 {
+			return int(n)
+		}
+	case int32:
+		if n > 0 {
+			return int(n)
+		}
+	case int64:
+		if n > 0 {
+			return int(n)
+		}
+	case float32:
+		if n > 0 {
+			return int(n)
+		}
+	case float64:
+		if n > 0 {
+			return int(n)
+		}
+	}
+	return 0
+}
+
 func translateToolChoice(raw json.RawMessage) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
@@ -396,7 +702,12 @@ func translateToolChoice(raw json.RawMessage) any {
 	return nil
 }
 
-func translateOutputConfig(raw json.RawMessage) any {
+type outputConfigState struct {
+	text            any
+	maxOutputTokens int
+}
+
+func translateOutputConfig(raw json.RawMessage) *outputConfigState {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -404,33 +715,42 @@ func translateOutputConfig(raw json.RawMessage) any {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil
 	}
-	format, ok := cfg["format"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	if stringValue(format["type"]) != "json_schema" {
-		return nil
-	}
 
-	// Extract schema - try format.json_schema.schema first, then format.schema
-	name := "response"
-	var schema any
-	if js, ok := format["json_schema"].(map[string]any); ok {
-		if n := stringValue(js["name"]); n != "" {
-			name = n
+	out := &outputConfigState{}
+	if format, ok := cfg["format"].(map[string]any); ok {
+		if stringValue(format["type"]) == "json_schema" {
+			// Extract schema - try format.json_schema.schema first, then format.schema
+			name := "response"
+			var schema any
+			if js, ok := format["json_schema"].(map[string]any); ok {
+				if n := stringValue(js["name"]); n != "" {
+					name = n
+				}
+				schema = js["schema"]
+			}
+			if schema == nil {
+				schema = format["schema"]
+			}
+			if schema != nil {
+				out.text = map[string]any{
+					"type":   "json_schema",
+					"name":   name,
+					"schema": schema,
+				}
+			}
 		}
-		schema = js["schema"]
-	}
-	if schema == nil {
-		schema = format["schema"]
-	}
-	if schema == nil {
-		return nil
 	}
 
-	return map[string]any{
-		"type":   "json_schema",
-		"name":   name,
-		"schema": schema,
+	if taskBudget, ok := cfg["task_budget"].(map[string]any); ok {
+		if remaining := positiveInt(taskBudget["remaining"]); remaining > 0 {
+			out.maxOutputTokens = remaining
+		} else if total := positiveInt(taskBudget["total"]); total > 0 {
+			out.maxOutputTokens = total
+		}
 	}
+
+	if out.text == nil && out.maxOutputTokens == 0 {
+		return nil
+	}
+	return out
 }
