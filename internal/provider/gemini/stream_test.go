@@ -431,6 +431,44 @@ func TestStreamConverterUnknownFinishReasonFallsBackToEndTurn(t *testing.T) {
 	}
 }
 
+func TestStreamConverterFinalizeAfterPartialStartProducesCompleteMessage(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514", nil)
+
+	raw, _, err := converter.ProcessResponse(&generateContentResponse{})
+	if err != nil {
+		t.Fatalf("ProcessResponse returned error: %v", err)
+	}
+	raw = append(raw, converter.Finalize()...)
+
+	events := decodeGeminiAnthropicSSE(t, raw)
+	assertGeminiEventTypes(t, events, []string{
+		"message_start",
+		"content_block_start",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	})
+
+	var delta struct {
+		Delta struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(events[3].Data), &delta); err != nil {
+		t.Fatalf("decode message_delta: %v", err)
+	}
+	if delta.Delta.StopReason != "end_turn" {
+		t.Fatalf("expected stop_reason end_turn, got %q", delta.Delta.StopReason)
+	}
+	if delta.Usage.InputTokens != 0 || delta.Usage.OutputTokens != 0 {
+		t.Fatalf("unexpected usage in partial finalize: %+v", delta.Usage)
+	}
+}
+
 func decodeGeminiAnthropicSSE(t *testing.T, raw [][]byte) []sse.Event {
 	t.Helper()
 

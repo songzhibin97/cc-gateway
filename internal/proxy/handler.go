@@ -24,6 +24,7 @@ import (
 const maxRequestBodyBytes = 10 * 1024 * 1024
 const maxRecordedPayloadBytes = 1 * 1024 * 1024
 const truncatedPayloadSuffix = "\n...[truncated]"
+const streamPreludeBufferBytes = 1024
 
 // Handler handles POST /v1/messages requests.
 type Handler struct {
@@ -248,12 +249,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			sseWriter := sse.NewWriter(rw)
+			sseWriter := sse.NewBufferedWriter(rw, streamPreludeBufferBytes)
 			activeRequests.Inc()
 			usage, streamErr = func() (*domain.Usage, error) {
 				defer activeRequests.Dec()
 				return prov.Stream(ctx, account, &req, sseWriter)
 			}()
+			if streamErr == nil {
+				if err := sseWriter.FlushBuffered(); err != nil {
+					streamErr = fmt.Errorf("flush buffered SSE: %w", err)
+				}
+			}
 			if streamErr == nil {
 				break
 			}

@@ -92,6 +92,9 @@ func (a *Adapter) Stream(ctx context.Context, account *domain.Account, req *doma
 			break
 		}
 		if err != nil {
+			if finalizeErr := writeFinalSSE(w, converter); finalizeErr != nil {
+				return usage, fmt.Errorf("read upstream SSE: %w (failed to finalize SSE: %v)", err, finalizeErr)
+			}
 			return usage, fmt.Errorf("read upstream SSE: %w", err)
 		}
 		if event.Data == "" || event.Data == "[DONE]" {
@@ -100,11 +103,17 @@ func (a *Adapter) Stream(ctx context.Context, account *domain.Account, req *doma
 
 		var upstream generateContentResponse
 		if err := json.Unmarshal([]byte(event.Data), &upstream); err != nil {
+			if finalizeErr := writeFinalSSE(w, converter); finalizeErr != nil {
+				return usage, fmt.Errorf("decode upstream SSE: %w (failed to finalize SSE: %v)", err, finalizeErr)
+			}
 			return usage, fmt.Errorf("decode upstream SSE: %w", err)
 		}
 
 		rawEvents, currentUsage, err := converter.ProcessResponse(&upstream)
 		if err != nil {
+			if finalizeErr := writeFinalSSE(w, converter); finalizeErr != nil {
+				return usage, fmt.Errorf("translate upstream SSE: %w (failed to finalize SSE: %v)", err, finalizeErr)
+			}
 			return usage, fmt.Errorf("translate upstream SSE: %w", err)
 		}
 		if currentUsage != nil {
@@ -121,16 +130,23 @@ func (a *Adapter) Stream(ctx context.Context, account *domain.Account, req *doma
 		}
 	}
 
+	if err := writeFinalSSE(w, converter); err != nil {
+		return usage, fmt.Errorf("write final SSE event: %w", err)
+	}
+
+	return usage, nil
+}
+
+func writeFinalSSE(w *sse.Writer, converter *StreamConverter) error {
 	for _, raw := range converter.Finalize() {
 		if len(raw) == 0 {
 			continue
 		}
 		if err := w.WriteRawEvent(raw); err != nil {
-			return usage, fmt.Errorf("write final SSE event: %w", err)
+			return err
 		}
 	}
-
-	return usage, nil
+	return nil
 }
 
 type contextKey string
