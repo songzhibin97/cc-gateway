@@ -171,6 +171,124 @@ func TestStreamConverterReasoningSummaryMapsToThinking(t *testing.T) {
 	}
 }
 
+func TestStreamConverterReasoningDeltaMapsToThinking(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514")
+
+	raw := processOpenAIEvents(t, converter,
+		sse.Event{Type: "response.created", Data: `{"response":{"id":"resp_reason_delta","model":"gpt-5.2","usage":{"input_tokens":5,"output_tokens":0}}}`},
+		sse.Event{Type: "response.reasoning.delta", Data: `{"delta":"Let me think..."}`},
+		sse.Event{Type: "response.reasoning.done", Data: `{}`},
+		sse.Event{Type: "response.completed", Data: `{"response":{"id":"resp_reason_delta","model":"gpt-5.2","status":"completed","usage":{"input_tokens":5,"output_tokens":10,"total_tokens":15}}}`},
+	)
+
+	events := decodeAnthropicSSE(t, raw)
+	assertEventTypes(t, events, []string{
+		"message_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	})
+
+	var delta struct {
+		Delta struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[2].Data), &delta); err != nil {
+		t.Fatalf("decode reasoning delta: %v", err)
+	}
+	if delta.Delta.Type != "thinking_delta" || delta.Delta.Thinking != "Let me think..." {
+		t.Fatalf("unexpected reasoning delta: %+v", delta.Delta)
+	}
+}
+
+func TestStreamConverterRefusalMapsToText(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514")
+
+	raw := processOpenAIEvents(t, converter,
+		sse.Event{Type: "response.created", Data: `{"response":{"id":"resp_refusal","model":"gpt-5.2"}}`},
+		sse.Event{Type: "response.content_part.added", Data: `{"item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"refusal","text":""}}`},
+		sse.Event{Type: "response.refusal.delta", Data: `{"item_id":"msg_1","output_index":0,"content_index":0,"delta":"I can't help with that."}`},
+		sse.Event{Type: "response.refusal.done", Data: `{"item_id":"msg_1","output_index":0,"content_index":0,"refusal":"I can't help with that."}`},
+		sse.Event{Type: "response.completed", Data: `{"response":{"id":"resp_refusal","model":"gpt-5.2","status":"completed","usage":{"input_tokens":3,"output_tokens":6,"total_tokens":9}}}`},
+	)
+
+	events := decodeAnthropicSSE(t, raw)
+	assertEventTypes(t, events, []string{
+		"message_start",
+		"content_block_start",
+		"content_block_delta",
+		"content_block_stop",
+		"message_delta",
+		"message_stop",
+	})
+
+	var delta struct {
+		Delta struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+	}
+	if err := json.Unmarshal([]byte(events[2].Data), &delta); err != nil {
+		t.Fatalf("decode refusal delta: %v", err)
+	}
+	if delta.Delta.Type != "text_delta" || delta.Delta.Text != "I can't help with that." {
+		t.Fatalf("unexpected refusal delta: %+v", delta.Delta)
+	}
+}
+
+func TestStreamConverterCompletedUsesCacheUsageAndMaxTokensStopReason(t *testing.T) {
+	converter := NewStreamConverter("claude-sonnet-4-20250514")
+
+	raw := processOpenAIEvents(t, converter,
+		sse.Event{Type: "response.created", Data: `{"response":{"id":"resp_incomplete","model":"gpt-5.2"}}`},
+		sse.Event{Type: "response.content_part.added", Data: `{"output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`},
+		sse.Event{Type: "response.output_text.delta", Data: `{"output_index":0,"content_index":0,"delta":"partial"}`},
+		sse.Event{Type: "response.output_text.done", Data: `{"output_index":0,"content_index":0,"text":"partial"}`},
+		sse.Event{Type: "response.completed", Data: `{"response":{"id":"resp_incomplete","model":"gpt-5.2","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":50,"input_tokens_details":{"cached_tokens":80},"cache_creation_input_tokens":20,"output_tokens_details":{"reasoning_tokens":11}}}}`},
+	)
+
+	events := decodeAnthropicSSE(t, raw)
+
+	var delta struct {
+		Delta struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			CacheRead    int `json:"cache_read_input_tokens"`
+			CacheWrite   int `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(events[4].Data), &delta); err != nil {
+		t.Fatalf("decode completed delta: %v", err)
+	}
+	if delta.Delta.StopReason != "max_tokens" {
+		t.Fatalf("expected stop_reason max_tokens, got %q", delta.Delta.StopReason)
+	}
+	if delta.Usage.InputTokens != 100 || delta.Usage.OutputTokens != 50 {
+		t.Fatalf("unexpected usage tokens: %+v", delta.Usage)
+	}
+	if delta.Usage.CacheRead != 80 || delta.Usage.CacheWrite != 20 {
+		t.Fatalf("unexpected cache usage: %+v", delta.Usage)
+	}
+
+	converted, usage, err := converter.ProcessEvent(sse.Event{Type: "response.in_progress", Data: `{"type":"response.in_progress"}`})
+	if err != nil {
+		t.Fatalf("ProcessEvent(response.in_progress) returned error: %v", err)
+	}
+	if len(converted) != 0 {
+		t.Fatalf("expected no payloads for response.in_progress, got %d", len(converted))
+	}
+	if usage.CacheReadTokens != 80 || usage.CacheWriteTokens != 20 || usage.ThinkingTokens != 11 {
+		t.Fatalf("unexpected converter usage: %+v", usage)
+	}
+}
+
 func TestStreamConverterFinalizeEmitsFillerForEmptyResponse(t *testing.T) {
 	converter := NewStreamConverter("claude-sonnet-4-20250514")
 

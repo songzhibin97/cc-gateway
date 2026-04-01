@@ -15,6 +15,7 @@ type responsesRequest struct {
 	Instructions    string              `json:"instructions,omitempty"`
 	Tools           []responsesTool     `json:"tools,omitempty"`
 	ToolChoice      any                 `json:"tool_choice,omitempty"`
+	PromptCacheKey  string              `json:"prompt_cache_key,omitempty"`
 	Text            any                 `json:"text,omitempty"`
 	Stop            []string            `json:"stop,omitempty"`
 	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
@@ -100,6 +101,9 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 	}
 	if len(req.ToolChoice) > 0 {
 		out.ToolChoice = translateToolChoice(req.ToolChoice)
+	}
+	if promptCacheKey := strings.TrimSpace(stringValue(extra["prompt_cache_key"])); promptCacheKey != "" {
+		out.PromptCacheKey = promptCacheKey
 	}
 	if outputConfig := translateOutputConfig(req.OutputConfig); outputConfig != nil {
 		if outputConfig.text != nil {
@@ -196,7 +200,7 @@ func translateTools(raw json.RawMessage, toolFilter string) ([]responsesTool, er
 			Function: responsesFunction{
 				Name:        tool.Name,
 				Description: tool.Description,
-				Parameters:  tool.InputSchema,
+				Parameters:  cleanSchemaMap(tool.InputSchema),
 			},
 		})
 	}
@@ -694,9 +698,7 @@ func translateToolChoice(raw json.RawMessage) any {
 		}
 		return map[string]any{
 			"type": "function",
-			"function": map[string]any{
-				"name": name,
-			},
+			"name": name,
 		}
 	}
 	return nil
@@ -735,7 +737,7 @@ func translateOutputConfig(raw json.RawMessage) *outputConfigState {
 				out.text = map[string]any{
 					"type":   "json_schema",
 					"name":   name,
-					"schema": schema,
+					"schema": cleanSchema(schema),
 				}
 			}
 		}
@@ -753,4 +755,37 @@ func translateOutputConfig(raw json.RawMessage) *outputConfigState {
 		return nil
 	}
 	return out
+}
+
+func cleanSchemaMap(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	cleaned, ok := cleanSchema(schema).(map[string]any)
+	if !ok {
+		return schema
+	}
+	return cleaned
+}
+
+func cleanSchema(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(typed))
+		for key, value := range typed {
+			cleaned[key] = cleanSchema(value)
+		}
+		if format, ok := cleaned["format"].(string); ok && format == "uri" {
+			delete(cleaned, "format")
+		}
+		return cleaned
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cleanSchema(item)
+		}
+		return out
+	default:
+		return v
+	}
 }

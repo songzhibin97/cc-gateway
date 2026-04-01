@@ -20,8 +20,9 @@ type responseEnvelope struct {
 
 type responseCreatedEvent struct {
 	Response struct {
-		ID    string `json:"id"`
-		Model string `json:"model"`
+		ID    string        `json:"id"`
+		Model string        `json:"model"`
+		Usage responseUsage `json:"usage"`
 	} `json:"response"`
 }
 
@@ -49,6 +50,20 @@ type responseOutputTextDoneEvent struct {
 	Text         string `json:"text"`
 }
 
+type responseRefusalDeltaEvent struct {
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	Delta        string `json:"delta"`
+}
+
+type responseRefusalDoneEvent struct {
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	Refusal      string `json:"refusal"`
+}
+
 type responseOutputItemAddedEvent struct {
 	OutputIndex int `json:"output_index"`
 	Item        struct {
@@ -74,15 +89,31 @@ type responseFunctionCallArgumentsDoneEvent struct {
 
 type responseCompletedEvent struct {
 	Response struct {
-		ID     string `json:"id"`
-		Model  string `json:"model"`
-		Status string `json:"status"`
-		Usage  struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-			TotalTokens  int `json:"total_tokens"`
-		} `json:"usage"`
+		ID                string `json:"id"`
+		Model             string `json:"model"`
+		Status            string `json:"status"`
+		IncompleteDetails struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Usage responseUsage `json:"usage"`
 	} `json:"response"`
+}
+
+type responseUsage struct {
+	InputTokens        int `json:"input_tokens"`
+	OutputTokens       int `json:"output_tokens"`
+	TotalTokens        int `json:"total_tokens"`
+	InputTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	OutputTokensDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // responseReasoningSummaryPartAddedEvent represents the
@@ -117,6 +148,20 @@ type responseReasoningSummaryTextDoneEvent struct {
 	OutputIndex  int    `json:"output_index"`
 	SummaryIndex int    `json:"summary_index"`
 	Text         string `json:"text"`
+}
+
+type responseReasoningDeltaEvent struct {
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	Delta        string `json:"delta"`
+	Text         string `json:"text"`
+}
+
+type responseReasoningDoneEvent struct {
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
 }
 
 type StreamConverter struct {
@@ -160,6 +205,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 		if evt.Response.ID != "" {
 			c.messageID = evt.Response.ID
 		}
+		c.applyUsage(evt.Response.Usage)
 		// Do NOT overwrite c.model with upstream model name (e.g. "gpt-5.4-codex").
 		// CC uses the model name for tokenizer selection and context window lookup.
 		raw, err := c.ensureMessageStart()
@@ -175,7 +221,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
 			return nil, c.usage, fmt.Errorf("decode response.content_part.added: %w", err)
 		}
-		if evt.Part.Type != "output_text" {
+		if evt.Part.Type != "output_text" && evt.Part.Type != "refusal" {
 			return nil, c.usage, nil
 		}
 		raw, err := c.ensureMessageStart()
@@ -188,7 +234,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 
 		index := c.nextIndex()
 		c.blocksByIndex[index] = &contentBlockState{BlockType: "text"}
-		c.textBlocks[textBlockKey(evt.ItemID, evt.ContentIndex)] = index
+		c.textBlocks[contentPartKey(evt.ItemID, evt.OutputIndex, evt.ContentIndex)] = index
 
 		raw, err = formatAnthropicEvent("content_block_start", map[string]any{
 			"index": index,
@@ -207,7 +253,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
 			return nil, c.usage, fmt.Errorf("decode response.output_text.delta: %w", err)
 		}
-		index, ok := c.textBlocks[textBlockKey(evt.ItemID, evt.ContentIndex)]
+		index, ok := c.textBlocks[contentPartKey(evt.ItemID, evt.OutputIndex, evt.ContentIndex)]
 		if !ok {
 			return nil, c.usage, fmt.Errorf("missing text block for item_id=%q content_index=%d", evt.ItemID, evt.ContentIndex)
 		}
@@ -228,7 +274,45 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
 			return nil, c.usage, fmt.Errorf("decode response.output_text.done: %w", err)
 		}
-		index, ok := c.textBlocks[textBlockKey(evt.ItemID, evt.ContentIndex)]
+		index, ok := c.textBlocks[contentPartKey(evt.ItemID, evt.OutputIndex, evt.ContentIndex)]
+		if !ok {
+			return nil, c.usage, nil
+		}
+		raw, err := c.closeBlock(index)
+		if err != nil {
+			return nil, c.usage, err
+		}
+		if len(raw) != 0 {
+			payloads = append(payloads, raw)
+		}
+
+	case "response.refusal.delta":
+		var evt responseRefusalDeltaEvent
+		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
+			return nil, c.usage, fmt.Errorf("decode response.refusal.delta: %w", err)
+		}
+		index, ok := c.textBlocks[contentPartKey(evt.ItemID, evt.OutputIndex, evt.ContentIndex)]
+		if !ok {
+			return nil, c.usage, fmt.Errorf("missing refusal block for item_id=%q content_index=%d", evt.ItemID, evt.ContentIndex)
+		}
+		raw, err := formatAnthropicEvent("content_block_delta", map[string]any{
+			"index": index,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": evt.Delta,
+			},
+		})
+		if err != nil {
+			return nil, c.usage, err
+		}
+		payloads = append(payloads, raw)
+
+	case "response.refusal.done":
+		var evt responseRefusalDoneEvent
+		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
+			return nil, c.usage, fmt.Errorf("decode response.refusal.done: %w", err)
+		}
+		index, ok := c.textBlocks[contentPartKey(evt.ItemID, evt.OutputIndex, evt.ContentIndex)]
 		if !ok {
 			return nil, c.usage, nil
 		}
@@ -421,6 +505,73 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 			payloads = append(payloads, raw)
 		}
 
+	case "response.reasoning.delta":
+		var evt responseReasoningDeltaEvent
+		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
+			return nil, c.usage, fmt.Errorf("decode response.reasoning.delta: %w", err)
+		}
+		raw, err := c.ensureMessageStart()
+		if err != nil {
+			return nil, c.usage, err
+		}
+		if len(raw) != 0 {
+			payloads = append(payloads, raw)
+		}
+
+		key := reasoningBlockKey(evt.ItemID, evt.OutputIndex, -1, evt.ContentIndex)
+		index, ok := c.thinkingBlocks[key]
+		if !ok {
+			index = c.nextIndex()
+			c.blocksByIndex[index] = &contentBlockState{BlockType: "thinking"}
+			c.thinkingBlocks[key] = index
+
+			raw, err = formatAnthropicEvent("content_block_start", map[string]any{
+				"index": index,
+				"content_block": map[string]any{
+					"type":     "thinking",
+					"thinking": "",
+				},
+			})
+			if err != nil {
+				return nil, c.usage, err
+			}
+			payloads = append(payloads, raw)
+		}
+
+		delta := evt.Delta
+		if delta == "" {
+			delta = evt.Text
+		}
+		raw, err = formatAnthropicEvent("content_block_delta", map[string]any{
+			"index": index,
+			"delta": map[string]any{
+				"type":     "thinking_delta",
+				"thinking": delta,
+			},
+		})
+		if err != nil {
+			return nil, c.usage, err
+		}
+		payloads = append(payloads, raw)
+
+	case "response.reasoning.done":
+		var evt responseReasoningDoneEvent
+		if err := json.Unmarshal([]byte(event.Data), &evt); err != nil {
+			return nil, c.usage, fmt.Errorf("decode response.reasoning.done: %w", err)
+		}
+		key := reasoningBlockKey(evt.ItemID, evt.OutputIndex, -1, evt.ContentIndex)
+		index, ok := c.thinkingBlocks[key]
+		if !ok {
+			return nil, c.usage, nil
+		}
+		raw, err := c.closeBlock(index)
+		if err != nil {
+			return nil, c.usage, err
+		}
+		if len(raw) != 0 {
+			payloads = append(payloads, raw)
+		}
+
 	// ── Completion ───────────────────────────────────────────────────
 
 	case "response.completed":
@@ -431,8 +582,7 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 		if evt.Response.ID != "" {
 			c.messageID = evt.Response.ID
 		}
-		c.usage.InputTokens = evt.Response.Usage.InputTokens
-		c.usage.OutputTokens = evt.Response.Usage.OutputTokens
+		c.applyUsage(evt.Response.Usage)
 
 		raw, err := c.ensureMessageStart()
 		if err != nil {
@@ -456,22 +606,14 @@ func (c *StreamConverter) ProcessEvent(event sse.Event) ([][]byte, *domain.Usage
 			}
 			payloads = append(payloads, filler...)
 
-			stopReason := "end_turn"
-			if c.sawFunctionCall {
-				stopReason = "tool_use"
-			}
+			stopReason := responseStopReason(evt.Response.Status, c.sawFunctionCall, evt.Response.IncompleteDetails.Reason)
 
 			raw, err = formatAnthropicEvent("message_delta", map[string]any{
 				"delta": map[string]any{
 					"stop_reason":   stopReason,
 					"stop_sequence": nil,
 				},
-				"usage": map[string]any{
-					"input_tokens":                evt.Response.Usage.InputTokens,
-					"output_tokens":               evt.Response.Usage.OutputTokens,
-					"cache_creation_input_tokens":  0,
-					"cache_read_input_tokens":      0,
-				},
+				"usage": anthropicUsagePayload(c.usage),
 			})
 			if err != nil {
 				return nil, c.usage, err
@@ -534,8 +676,8 @@ func (c *StreamConverter) Finalize() [][]byte {
 		"usage": map[string]any{
 			"input_tokens":                c.usage.InputTokens,
 			"output_tokens":               c.usage.OutputTokens,
-			"cache_creation_input_tokens":  0,
-			"cache_read_input_tokens":      0,
+			"cache_creation_input_tokens": 0,
+			"cache_read_input_tokens":     0,
 		},
 	})
 	if err == nil {
@@ -566,10 +708,10 @@ func (c *StreamConverter) ensureMessageStart() ([]byte, error) {
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
-				"input_tokens":                0,
-				"output_tokens":               0,
-				"cache_creation_input_tokens":  0,
-				"cache_read_input_tokens":      0,
+				"input_tokens":                c.usage.InputTokens,
+				"output_tokens":               c.usage.OutputTokens,
+				"cache_creation_input_tokens": c.usage.CacheWriteTokens,
+				"cache_read_input_tokens":     c.usage.CacheReadTokens,
 			},
 		},
 	})
@@ -633,12 +775,87 @@ func (c *StreamConverter) ensureContentBlock() ([][]byte, error) {
 	return [][]byte{start, stop}, nil
 }
 
-func textBlockKey(itemID string, contentIndex int) string {
-	return fmt.Sprintf("%s:%d", itemID, contentIndex)
+func contentPartKey(itemID string, outputIndex, contentIndex int) string {
+	if itemID != "" {
+		return fmt.Sprintf("%s:%d", itemID, contentIndex)
+	}
+	return fmt.Sprintf("out:%d:%d", outputIndex, contentIndex)
 }
 
 func thinkingBlockKey(itemID string, summaryIndex int) string {
-	return fmt.Sprintf("think:%s:%d", itemID, summaryIndex)
+	return reasoningBlockKey(itemID, -1, summaryIndex, -1)
+}
+
+func reasoningBlockKey(itemID string, outputIndex, summaryIndex, contentIndex int) string {
+	switch {
+	case itemID != "" && summaryIndex >= 0:
+		return fmt.Sprintf("think:%s:summary:%d", itemID, summaryIndex)
+	case itemID != "" && contentIndex >= 0:
+		return fmt.Sprintf("think:%s:content:%d", itemID, contentIndex)
+	case itemID != "":
+		return "think:" + itemID
+	case outputIndex >= 0 && summaryIndex >= 0:
+		return fmt.Sprintf("think:out:%d:summary:%d", outputIndex, summaryIndex)
+	case outputIndex >= 0 && contentIndex >= 0:
+		return fmt.Sprintf("think:out:%d:content:%d", outputIndex, contentIndex)
+	case outputIndex >= 0:
+		return fmt.Sprintf("think:out:%d", outputIndex)
+	default:
+		return "think:default"
+	}
+}
+
+func (c *StreamConverter) applyUsage(upstream responseUsage) {
+	c.usage.InputTokens = upstream.InputTokens
+	c.usage.OutputTokens = upstream.OutputTokens
+	c.usage.ThinkingTokens = upstream.OutputTokensDetails.ReasoningTokens
+	c.usage.CacheReadTokens = upstream.InputTokensDetails.CachedTokens
+	if c.usage.CacheReadTokens == 0 {
+		c.usage.CacheReadTokens = upstream.PromptTokensDetails.CachedTokens
+	}
+	if upstream.CacheReadInputTokens > 0 {
+		c.usage.CacheReadTokens = upstream.CacheReadInputTokens
+	}
+	if upstream.CacheCreationInputTokens > 0 {
+		c.usage.CacheWriteTokens = upstream.CacheCreationInputTokens
+	}
+}
+
+func anthropicUsagePayload(usage *domain.Usage) map[string]any {
+	if usage == nil {
+		return map[string]any{
+			"input_tokens":                0,
+			"output_tokens":               0,
+			"cache_creation_input_tokens": 0,
+			"cache_read_input_tokens":     0,
+		}
+	}
+	return map[string]any{
+		"input_tokens":                usage.InputTokens,
+		"output_tokens":               usage.OutputTokens,
+		"cache_creation_input_tokens": usage.CacheWriteTokens,
+		"cache_read_input_tokens":     usage.CacheReadTokens,
+	}
+}
+
+func responseStopReason(status string, sawFunctionCall bool, incompleteReason string) string {
+	switch status {
+	case "completed":
+		if sawFunctionCall {
+			return "tool_use"
+		}
+		return "end_turn"
+	case "incomplete":
+		if incompleteReason == "" || incompleteReason == "max_output_tokens" || incompleteReason == "max_tokens" {
+			return "max_tokens"
+		}
+		return "end_turn"
+	default:
+		if sawFunctionCall {
+			return "tool_use"
+		}
+		return "end_turn"
+	}
 }
 
 func formatAnthropicEvent(eventType string, payload any) ([]byte, error) {

@@ -377,6 +377,114 @@ func TestTranslateRequestExplicitStripMCPStillWorks(t *testing.T) {
 	}
 }
 
+func TestTranslateRequestInjectsPromptCacheKey(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:    "gpt-5.2",
+		Messages: []domain.Message{},
+	}
+
+	out, err := translateRequest(req, map[string]any{
+		"prompt_cache_key": "account-123",
+	})
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if out.PromptCacheKey != "account-123" {
+		t.Fatalf("expected prompt_cache_key account-123, got %q", out.PromptCacheKey)
+	}
+}
+
+func TestTranslateRequestToolChoiceToolUsesResponsesShape(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:      "gpt-5.2",
+		Messages:   []domain.Message{},
+		ToolChoice: json.RawMessage(`{"type":"tool","name":"Read"}`),
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	choice := mustMap(t, out.ToolChoice)
+	if got := stringValue(choice["type"]); got != "function" {
+		t.Fatalf("expected tool_choice type function, got %q", got)
+	}
+	if got := stringValue(choice["name"]); got != "Read" {
+		t.Fatalf("expected tool_choice name Read, got %q", got)
+	}
+	if _, ok := choice["function"]; ok {
+		t.Fatalf("expected Responses tool_choice shape without nested function, got %+v", choice)
+	}
+}
+
+func TestTranslateRequestCleansToolSchemaURIFormat(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:    "gpt-5.2",
+		Messages: []domain.Message{},
+		Tools: json.RawMessage(`[
+			{"name":"Fetch","description":"fetch","input_schema":{
+				"type":"object",
+				"properties":{
+					"url":{"type":"string","format":"uri"},
+					"nested":{"type":"array","items":{"type":"string","format":"uri"}}
+				}
+			}}
+		]`),
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("expected one tool, got %d", len(out.Tools))
+	}
+	params := out.Tools[0].Function.Parameters
+	props := mustMap(t, params["properties"])
+	urlProp := mustMap(t, props["url"])
+	if _, ok := urlProp["format"]; ok {
+		t.Fatalf("expected root uri format to be removed, got %+v", urlProp)
+	}
+	nested := mustMap(t, props["nested"])
+	items := mustMap(t, nested["items"])
+	if _, ok := items["format"]; ok {
+		t.Fatalf("expected nested uri format to be removed, got %+v", items)
+	}
+}
+
+func TestTranslateRequestCleansOutputSchemaURIFormat(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model: "gpt-5.2",
+		OutputConfig: json.RawMessage(`{
+			"format": {
+				"type": "json_schema",
+				"json_schema": {
+					"name": "task",
+					"schema": {
+						"type": "object",
+						"properties": {
+							"link": {"type": "string", "format": "uri"}
+						}
+					}
+				}
+			}
+		}`),
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	textCfg := mustMap(t, out.Text)
+	format := mustMap(t, textCfg["format"])
+	schema := mustMap(t, format["schema"])
+	props := mustMap(t, schema["properties"])
+	link := mustMap(t, props["link"])
+	if _, ok := link["format"]; ok {
+		t.Fatalf("expected output schema uri format to be removed, got %+v", link)
+	}
+}
+
 func decodeJSONItems(t *testing.T, input []any) []map[string]any {
 	t.Helper()
 
