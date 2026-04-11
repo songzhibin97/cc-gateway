@@ -16,8 +16,6 @@ type responsesRequest struct {
 	Tools           []responsesTool     `json:"tools,omitempty"`
 	ToolChoice      any                 `json:"tool_choice,omitempty"`
 	PromptCacheKey  string              `json:"prompt_cache_key,omitempty"`
-	Text            any                 `json:"text,omitempty"`
-	Stop            []string            `json:"stop,omitempty"`
 	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
 	Temperature     *float64            `json:"temperature,omitempty"`
 	TopP            *float64            `json:"top_p,omitempty"`
@@ -33,8 +31,7 @@ type responsesTool struct {
 }
 
 type responsesReasoning struct {
-	Effort  string `json:"effort,omitempty"`
-	Summary string `json:"summary,omitempty"`
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthropicTool struct {
@@ -44,12 +41,6 @@ type anthropicTool struct {
 }
 
 const defaultReasoningEffort = "medium"
-
-type reasoningState struct {
-	reasoning         *responsesReasoning
-	enabled           bool
-	hasExplicitEffort bool
-}
 
 func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*responsesRequest, error) {
 	instructions, err := translateSystem(req.System)
@@ -66,8 +57,6 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		input = append(input, items...)
 	}
 
-	requestReasoning := translateReasoning(req.Thinking)
-
 	out := &responsesRequest{
 		Model:        req.Model,
 		Input:        input,
@@ -75,7 +64,6 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
 		Stream:       req.Stream,
-		Reasoning:    requestReasoning.reasoning,
 	}
 	if req.MaxTokens > 0 {
 		out.MaxOutputTokens = req.MaxTokens
@@ -101,48 +89,10 @@ func translateRequest(req *domain.CanonicalRequest, extra map[string]any) (*resp
 	if promptCacheKey := strings.TrimSpace(stringValue(extra["prompt_cache_key"])); promptCacheKey != "" {
 		out.PromptCacheKey = promptCacheKey
 	}
-	if outputConfig := translateOutputConfig(req.OutputConfig); outputConfig != nil {
-		if outputConfig.text != nil {
-			out.Text = map[string]any{
-				"format": outputConfig.text,
-			}
-		}
-		if outputConfig.maxOutputTokens > 0 && (out.MaxOutputTokens == 0 || outputConfig.maxOutputTokens < out.MaxOutputTokens) {
-			out.MaxOutputTokens = outputConfig.maxOutputTokens
-		}
-	}
-	if len(req.StopSequences) > 0 {
-		out.Stop = req.StopSequences
-	}
 
-	// reasoning 仅在请求明确要求 thinking 时启用。
-	if requestReasoning.enabled {
-		effortKey := strings.TrimSpace(stringValue(extra["thinking_effort"]))
-		if effortKey == "" {
-			effortKey = strings.TrimSpace(stringValue(extra["reasoning_effort"]))
-		}
-		if out.Reasoning == nil {
-			out.Reasoning = &responsesReasoning{}
-		}
-		if requestReasoning.hasExplicitEffort {
-			out.Reasoning.Effort = requestReasoning.reasoning.Effort
-		} else if effortKey != "" {
-			out.Reasoning.Effort = effortKey
-		} else if out.Reasoning.Effort == "" {
-			out.Reasoning.Effort = defaultReasoningEffort
-		}
-	}
-	// summary 只在 reasoning 已存在时补充，不凭空创建 reasoning
-	if out.Reasoning != nil {
-		summaryKey := stringValue(extra["thinking_summary"])
-		if summaryKey == "" {
-			summaryKey = stringValue(extra["reasoning_summary"])
-		}
-		if summaryKey == "" {
-			summaryKey = "auto"
-		}
-		if out.Reasoning.Summary == "" {
-			out.Reasoning.Summary = summaryKey
+	if supportsReasoningEffort(req.Model) {
+		if effort := resolveReasoningEffort(req.Thinking, req.OutputConfig, extra); effort != "" {
+			out.Reasoning = &responsesReasoning{Effort: effort}
 		}
 	}
 
@@ -226,8 +176,6 @@ func translateMessage(msg domain.Message) ([]any, error) {
 func translateContentBlocks(role string, blocks []map[string]any) ([]any, error) {
 	var out []any
 	var textBlocks []map[string]any
-	var reasoningBlocks []map[string]any
-	reasoningIndex := 0
 
 	flushText := func() {
 		if len(textBlocks) == 0 {
@@ -240,19 +188,9 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 		textBlocks = nil
 	}
 
-	flushReasoning := func() {
-		if len(reasoningBlocks) == 0 {
-			return
-		}
-		out = append(out, buildReasoningItem(reasoningBlocks, reasoningIndex))
-		reasoningIndex++
-		reasoningBlocks = nil
-	}
-
 	for _, block := range blocks {
 		switch blockType := stringValue(block["type"]); blockType {
 		case "text":
-			flushReasoning()
 			partType := "input_text"
 			if role == "assistant" {
 				partType = "output_text"
@@ -262,7 +200,6 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 				"text": stringValue(block["text"]),
 			})
 		case "connector_text":
-			flushReasoning()
 			partType := "input_text"
 			if role == "assistant" {
 				partType = "output_text"
@@ -276,14 +213,12 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 				"text": text,
 			})
 		case "image":
-			flushReasoning()
 			if contentBlock, ok := translateImageContentBlock(block); ok {
 				textBlocks = append(textBlocks, contentBlock)
 				continue
 			}
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "document":
-			flushReasoning()
 			if contentBlock, ok := translateDocumentContentBlock(block); ok {
 				textBlocks = append(textBlocks, contentBlock)
 				continue
@@ -291,7 +226,6 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "tool_use":
 			flushText()
-			flushReasoning()
 			if item, ok := translateFunctionCallItem(block, blockType); ok {
 				out = append(out, item)
 				continue
@@ -299,7 +233,6 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "server_tool_use", "mcp_tool_use":
 			flushText()
-			flushReasoning()
 			if item, ok := translateFunctionCallItem(block, blockType); ok {
 				out = append(out, item)
 				continue
@@ -307,23 +240,19 @@ func translateContentBlocks(role string, blocks []map[string]any) ([]any, error)
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "tool_result", "web_search_tool_result", "mcp_tool_result", "code_execution_tool_result", "web_fetch_tool_result", "bash_code_execution_tool_result", "text_editor_code_execution_tool_result", "tool_search_tool_result":
 			flushText()
-			flushReasoning()
 			if item, ok := translateFunctionCallOutputItem(block); ok {
 				out = append(out, item)
 				continue
 			}
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		case "thinking", "redacted_thinking":
-			flushText()
-			reasoningBlocks = append(reasoningBlocks, block)
+			// Align with cc-switch: drop historical thinking blocks from Responses input.
 		default:
-			flushReasoning()
 			textBlocks = append(textBlocks, fallbackTextContentBlock(role, block))
 		}
 	}
 
 	flushText()
-	flushReasoning()
 	return out, nil
 }
 
@@ -471,7 +400,6 @@ func translateFunctionCallItem(block map[string]any, blockType string) (map[stri
 
 	item := map[string]any{
 		"type":      "function_call",
-		"id":        callID,
 		"call_id":   callID,
 		"name":      name,
 		"arguments": string(arguments),
@@ -496,7 +424,6 @@ func translateFunctionCallOutputItem(block map[string]any) (map[string]any, bool
 
 	return map[string]any{
 		"type":    "function_call_output",
-		"id":      callID,
 		"call_id": callID,
 		"output":  output,
 	}, true
@@ -577,57 +504,119 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func translateReasoning(raw json.RawMessage) reasoningState {
+func supportsReasoningEffort(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if len(model) > 1 && model[0] == 'o' && model[1] >= '1' && model[1] <= '9' {
+		return true
+	}
+	if strings.HasPrefix(model, "gpt-") {
+		rest := strings.TrimPrefix(model, "gpt-")
+		if len(rest) > 0 && rest[0] >= '5' && rest[0] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveReasoningEffort(thinkingRaw, outputConfigRaw json.RawMessage, extra map[string]any) string {
+	if effort := outputConfigEffort(outputConfigRaw); effort != "" {
+		return effort
+	}
+
+	thinking := parseThinkingPayload(thinkingRaw)
+	if !thinking.enabled {
+		return ""
+	}
+
+	if thinking.explicitEffort != "" {
+		return thinking.explicitEffort
+	}
+	if effortKey := strings.TrimSpace(stringValue(extra["thinking_effort"])); effortKey != "" {
+		return effortKey
+	}
+	if effortKey := strings.TrimSpace(stringValue(extra["reasoning_effort"])); effortKey != "" {
+		return effortKey
+	}
+	if thinking.adaptive {
+		return "xhigh"
+	}
+	if thinking.budgetTokens > 0 {
+		switch {
+		case thinking.budgetTokens < 4000:
+			return "low"
+		case thinking.budgetTokens < 16000:
+			return "medium"
+		default:
+			return "high"
+		}
+	}
+	return defaultReasoningEffort
+}
+
+type thinkingPayload struct {
+	enabled        bool
+	adaptive       bool
+	explicitEffort string
+	budgetTokens   int
+}
+
+func parseThinkingPayload(raw json.RawMessage) thinkingPayload {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return reasoningState{}
+		return thinkingPayload{}
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return reasoningState{
-			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
-			enabled:   true,
-		}
+		return thinkingPayload{enabled: true}
 	}
 
-	// Anthropic "thinking" settings do not map 1:1. Preserve only effort-like hints.
 	for _, key := range []string{"effort", "level"} {
 		if effort := strings.TrimSpace(stringValue(payload[key])); effort != "" {
-			return reasoningState{
-				reasoning:         &responsesReasoning{Effort: effort},
-				enabled:           true,
-				hasExplicitEffort: true,
+			return thinkingPayload{
+				enabled:        true,
+				explicitEffort: effort,
+				budgetTokens:   positiveInt(payload["budget_tokens"]),
 			}
 		}
 	}
 
 	switch strings.TrimSpace(stringValue(payload["type"])) {
-	case "enabled":
-		return reasoningState{
-			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
-			enabled:   true,
-		}
-	case "adaptive":
-		return reasoningState{
-			enabled: true,
-		}
 	case "disabled":
-		return reasoningState{}
+		return thinkingPayload{}
+	case "adaptive":
+		return thinkingPayload{enabled: true, adaptive: true}
+	case "enabled":
+		return thinkingPayload{enabled: true, budgetTokens: positiveInt(payload["budget_tokens"])}
 	}
 
 	if enabled, ok := payload["enabled"].(bool); ok {
 		if !enabled {
-			return reasoningState{}
+			return thinkingPayload{}
 		}
-		return reasoningState{
-			reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
-			enabled:   true,
-		}
+		return thinkingPayload{enabled: true, budgetTokens: positiveInt(payload["budget_tokens"])}
 	}
 
-	return reasoningState{
-		reasoning: &responsesReasoning{Effort: defaultReasoningEffort},
-		enabled:   true,
+	return thinkingPayload{enabled: true, budgetTokens: positiveInt(payload["budget_tokens"])}
+}
+
+func outputConfigEffort(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return ""
+	}
+
+	effort := strings.TrimSpace(stringValue(cfg["effort"]))
+	switch effort {
+	case "low", "medium", "high":
+		return effort
+	case "max":
+		return "xhigh"
+	default:
+		return ""
 	}
 }
 
@@ -696,59 +685,6 @@ func translateToolChoice(raw json.RawMessage) any {
 		}
 	}
 	return nil
-}
-
-type outputConfigState struct {
-	text            any
-	maxOutputTokens int
-}
-
-func translateOutputConfig(raw json.RawMessage) *outputConfigState {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil
-	}
-	var cfg map[string]any
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil
-	}
-
-	out := &outputConfigState{}
-	if format, ok := cfg["format"].(map[string]any); ok {
-		if stringValue(format["type"]) == "json_schema" {
-			// Extract schema - try format.json_schema.schema first, then format.schema
-			name := "response"
-			var schema any
-			if js, ok := format["json_schema"].(map[string]any); ok {
-				if n := stringValue(js["name"]); n != "" {
-					name = n
-				}
-				schema = js["schema"]
-			}
-			if schema == nil {
-				schema = format["schema"]
-			}
-			if schema != nil {
-				out.text = map[string]any{
-					"type":   "json_schema",
-					"name":   name,
-					"schema": cleanSchema(schema),
-				}
-			}
-		}
-	}
-
-	if taskBudget, ok := cfg["task_budget"].(map[string]any); ok {
-		if remaining := positiveInt(taskBudget["remaining"]); remaining > 0 {
-			out.maxOutputTokens = remaining
-		} else if total := positiveInt(taskBudget["total"]); total > 0 {
-			out.maxOutputTokens = total
-		}
-	}
-
-	if out.text == nil && out.maxOutputTokens == 0 {
-		return nil
-	}
-	return out
 }
 
 func cleanSchemaMap(schema map[string]any) map[string]any {

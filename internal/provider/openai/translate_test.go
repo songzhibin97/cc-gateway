@@ -7,7 +7,7 @@ import (
 	"github.com/songzhibin97/cc-gateway/internal/domain"
 )
 
-func TestTranslateRequestPreservesThinkingAndRedactedThinking(t *testing.T) {
+func TestTranslateRequestDropsHistoricalThinkingBlocks(t *testing.T) {
 	req := &domain.CanonicalRequest{
 		Model: "gpt-5.2",
 		Messages: []domain.Message{
@@ -29,19 +29,8 @@ func TestTranslateRequestPreservesThinkingAndRedactedThinking(t *testing.T) {
 	}
 
 	items := decodeJSONItems(t, out.Input)
-	reasoning := findFirstItemByType(t, items, "reasoning")
-	summary := mustArrayOfMaps(t, reasoning["summary"])
-	if len(summary) != 2 {
-		t.Fatalf("expected 2 reasoning summaries, got %+v", summary)
-	}
-	if got := stringValue(summary[0]["text"]); got != "plan A" {
-		t.Fatalf("expected first reasoning summary plan A, got %q", got)
-	}
-	if got := stringValue(summary[1]["text"]); got == "" {
-		t.Fatal("expected redacted thinking summary to be preserved")
-	}
-	if got := stringValue(reasoning["encrypted_content"]); got == "" {
-		t.Fatal("expected encrypted_content to be preserved for redacted thinking")
+	if got := countItemsByType(items, "reasoning"); got != 0 {
+		t.Fatalf("expected historical thinking blocks to be dropped, got %d reasoning items", got)
 	}
 
 	call := findFirstItemByType(t, items, "function_call")
@@ -146,70 +135,6 @@ func TestTranslateRequestPreservesStructuredToolResultContent(t *testing.T) {
 	}
 }
 
-func TestTranslateRequestMapsOutputConfigToTextFormat(t *testing.T) {
-	req := &domain.CanonicalRequest{
-		Model: "gpt-5.2",
-		OutputConfig: json.RawMessage(`{
-			"format": {
-				"type": "json_schema",
-				"json_schema": {
-					"name": "task",
-					"schema": {
-						"type": "object",
-						"properties": {
-							"answer": {"type": "string"}
-						},
-						"required": ["answer"]
-					}
-				}
-			}
-		}`),
-	}
-
-	out, err := translateRequest(req, nil)
-	if err != nil {
-		t.Fatalf("translateRequest returned error: %v", err)
-	}
-	if out.Text == nil {
-		t.Fatal("expected text config to be populated")
-	}
-
-	textCfg := mustMap(t, out.Text)
-	format := mustMap(t, textCfg["format"])
-	if got := stringValue(format["type"]); got != "json_schema" {
-		t.Fatalf("expected json_schema format, got %q", got)
-	}
-	if got := stringValue(format["name"]); got != "task" {
-		t.Fatalf("expected schema name task, got %q", got)
-	}
-	schema := mustMap(t, format["schema"])
-	props := mustMap(t, schema["properties"])
-	if _, ok := props["answer"]; !ok {
-		t.Fatalf("expected answer property to be preserved, got %+v", schema)
-	}
-}
-
-func TestTranslateRequestMapsTaskBudgetToMaxOutputTokens(t *testing.T) {
-	req := &domain.CanonicalRequest{
-		Model:     "gpt-5.2",
-		MaxTokens: 2048,
-		OutputConfig: json.RawMessage(`{
-			"task_budget": {
-				"total": 1024,
-				"remaining": 512
-			}
-		}`),
-	}
-
-	out, err := translateRequest(req, nil)
-	if err != nil {
-		t.Fatalf("translateRequest returned error: %v", err)
-	}
-	if out.MaxOutputTokens != 512 {
-		t.Fatalf("expected task_budget remaining to cap max_output_tokens at 512, got %d", out.MaxOutputTokens)
-	}
-}
-
 func TestTranslateRequestWithoutThinkingDoesNotEnableReasoning(t *testing.T) {
 	req := &domain.CanonicalRequest{
 		Model:    "gpt-5.2",
@@ -241,11 +166,8 @@ func TestTranslateRequestWithThinkingEnabledUsesReasoning(t *testing.T) {
 	if out.Reasoning == nil {
 		t.Fatal("expected reasoning to be populated")
 	}
-	if out.Reasoning.Effort != "medium" {
-		t.Fatalf("expected default reasoning effort medium, got %q", out.Reasoning.Effort)
-	}
-	if out.Reasoning.Summary != "auto" {
-		t.Fatalf("expected reasoning summary auto, got %q", out.Reasoning.Summary)
+	if out.Reasoning.Effort != "high" {
+		t.Fatalf("expected budget-driven reasoning effort high, got %q", out.Reasoning.Effort)
 	}
 }
 
@@ -267,9 +189,6 @@ func TestTranslateRequestWithThinkingUsesConfiguredEffort(t *testing.T) {
 	}
 	if out.Reasoning.Effort != "xhigh" {
 		t.Fatalf("expected reasoning effort xhigh, got %q", out.Reasoning.Effort)
-	}
-	if out.Reasoning.Summary != "auto" {
-		t.Fatalf("expected reasoning summary auto, got %q", out.Reasoning.Summary)
 	}
 }
 
@@ -328,6 +247,28 @@ func TestTranslateRequestWithThinkingFallsBackToRequestHintWhenAccountUnset(t *t
 	}
 	if out.Reasoning.Effort != "high" {
 		t.Fatalf("expected reasoning effort high, got %q", out.Reasoning.Effort)
+	}
+}
+
+func TestTranslateRequestOutputConfigEffortTakesPriority(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:        "gpt-5.2",
+		Messages:     []domain.Message{},
+		Thinking:     json.RawMessage(`{"type":"enabled","budget_tokens":31999}`),
+		OutputConfig: json.RawMessage(`{"effort":"max"}`),
+	}
+
+	out, err := translateRequest(req, map[string]any{
+		"thinking_effort": "low",
+	})
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if out.Reasoning == nil {
+		t.Fatal("expected reasoning to be populated")
+	}
+	if out.Reasoning.Effort != "xhigh" {
+		t.Fatalf("expected output_config.effort=max to map to xhigh, got %q", out.Reasoning.Effort)
 	}
 }
 
@@ -420,6 +361,32 @@ func TestTranslateRequestToolChoiceToolUsesResponsesShape(t *testing.T) {
 	}
 }
 
+func TestTranslateRequestDropsStopSequencesForResponses(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:         "gpt-5.2",
+		Messages:      []domain.Message{},
+		StopSequences: []string{"END"},
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if _, ok := decoded["stop"]; ok {
+		t.Fatalf("expected Responses payload to drop stop sequences, got %+v", decoded)
+	}
+}
+
 func TestTranslateRequestCleansToolSchemaURIFormat(t *testing.T) {
 	req := &domain.CanonicalRequest{
 		Model:    "gpt-5.2",
@@ -492,36 +459,59 @@ func TestTranslateRequestUsesResponsesToolShape(t *testing.T) {
 	}
 }
 
-func TestTranslateRequestCleansOutputSchemaURIFormat(t *testing.T) {
+func TestTranslateRequestUsesResponsesFunctionCallItemShape(t *testing.T) {
 	req := &domain.CanonicalRequest{
 		Model: "gpt-5.2",
-		OutputConfig: json.RawMessage(`{
-			"format": {
-				"type": "json_schema",
-				"json_schema": {
-					"name": "task",
-					"schema": {
-						"type": "object",
-						"properties": {
-							"link": {"type": "string", "format": "uri"}
-						}
-					}
-				}
-			}
-		}`),
+		Messages: []domain.Message{
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"a.txt"}}
+				]`),
+			},
+		},
 	}
 
 	out, err := translateRequest(req, nil)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
-	textCfg := mustMap(t, out.Text)
-	format := mustMap(t, textCfg["format"])
-	schema := mustMap(t, format["schema"])
-	props := mustMap(t, schema["properties"])
-	link := mustMap(t, props["link"])
-	if _, ok := link["format"]; ok {
-		t.Fatalf("expected output schema uri format to be removed, got %+v", link)
+
+	items := decodeJSONItems(t, out.Input)
+	call := findFirstItemByType(t, items, "function_call")
+	if got := stringValue(call["call_id"]); got != "toolu_1" {
+		t.Fatalf("expected call_id toolu_1, got %q", got)
+	}
+	if _, ok := call["id"]; ok {
+		t.Fatalf("expected Responses function_call item without id, got %+v", call)
+	}
+}
+
+func TestTranslateRequestUsesResponsesFunctionCallOutputItemShape(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model: "gpt-5.2",
+		Messages: []domain.Message{
+			{
+				Role: "user",
+				Content: json.RawMessage(`[
+					{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}
+				]`),
+			},
+		},
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+
+	items := decodeJSONItems(t, out.Input)
+	callOutput := findFirstItemByType(t, items, "function_call_output")
+	if got := stringValue(callOutput["call_id"]); got != "toolu_1" {
+		t.Fatalf("expected call_id toolu_1, got %q", got)
+	}
+	if _, ok := callOutput["id"]; ok {
+		t.Fatalf("expected Responses function_call_output item without id, got %+v", callOutput)
 	}
 }
 
