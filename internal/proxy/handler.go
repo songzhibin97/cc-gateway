@@ -24,7 +24,7 @@ import (
 const maxRequestBodyBytes = 10 * 1024 * 1024
 const maxRecordedPayloadBytes = 1 * 1024 * 1024
 const truncatedPayloadSuffix = "\n...[truncated]"
-const streamPreludeBufferBytes = 1024
+const streamPreludeBufferBytes = 0
 
 // Handler handles POST /v1/messages requests.
 type Handler struct {

@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/songzhibin97/cc-gateway/internal/domain"
 	"github.com/songzhibin97/cc-gateway/pkg/sse"
 )
 
 const defaultBaseURL = "https://api.openai.com"
+
+var httpClientCache sync.Map
 
 type Adapter struct{}
 
@@ -53,15 +56,10 @@ func (a *Adapter) Stream(ctx context.Context, account *domain.Account, req *doma
 		httpReq.Header.Set("User-Agent", ua)
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if account.ProxyURL != "" {
-		proxyURL, err := url.Parse(account.ProxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("parse proxy URL: %w", err)
-		}
-		transport.Proxy = http.ProxyURL(proxyURL)
+	client, err := getHTTPClient(account.ProxyURL)
+	if err != nil {
+		return nil, err
 	}
-	client := &http.Client{Transport: transport}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -165,4 +163,24 @@ func maskAPIKeyInError(err error, apiKey string) string {
 		return err.Error()
 	}
 	return strings.ReplaceAll(err.Error(), apiKey, "***")
+}
+
+func getHTTPClient(rawProxyURL string) (*http.Client, error) {
+	cacheKey := strings.TrimSpace(rawProxyURL)
+	if client, ok := httpClientCache.Load(cacheKey); ok {
+		return client.(*http.Client), nil
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if cacheKey != "" {
+		proxyURL, err := url.Parse(cacheKey)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy URL: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+
+	client := &http.Client{Transport: transport}
+	actual, _ := httpClientCache.LoadOrStore(cacheKey, client)
+	return actual.(*http.Client), nil
 }
