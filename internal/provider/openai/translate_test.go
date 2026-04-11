@@ -348,8 +348,11 @@ func TestTranslateRequestDefaultsToPassthroughToolFiltering(t *testing.T) {
 	if len(out.Tools) != 2 {
 		t.Fatalf("expected both tools to pass through by default, got %d", len(out.Tools))
 	}
-	if out.Tools[0].Function.Name != "mcp__Read" || out.Tools[1].Function.Name != "Read" {
+	if out.Tools[0].Name != "mcp__Read" || out.Tools[1].Name != "Read" {
 		t.Fatalf("unexpected tool order/names: %+v", out.Tools)
+	}
+	if out.Tools[0].Parameters == nil || out.Tools[1].Parameters == nil {
+		t.Fatalf("expected flat Responses tool parameters, got %+v", out.Tools)
 	}
 }
 
@@ -372,7 +375,7 @@ func TestTranslateRequestExplicitStripMCPStillWorks(t *testing.T) {
 	if len(out.Tools) != 1 {
 		t.Fatalf("expected only one tool after strip_mcp, got %d", len(out.Tools))
 	}
-	if out.Tools[0].Function.Name != "Read" {
+	if out.Tools[0].Name != "Read" {
 		t.Fatalf("expected regular tool to remain, got %+v", out.Tools[0])
 	}
 }
@@ -439,7 +442,7 @@ func TestTranslateRequestCleansToolSchemaURIFormat(t *testing.T) {
 	if len(out.Tools) != 1 {
 		t.Fatalf("expected one tool, got %d", len(out.Tools))
 	}
-	params := out.Tools[0].Function.Parameters
+	params := out.Tools[0].Parameters
 	props := mustMap(t, params["properties"])
 	urlProp := mustMap(t, props["url"])
 	if _, ok := urlProp["format"]; ok {
@@ -449,6 +452,43 @@ func TestTranslateRequestCleansToolSchemaURIFormat(t *testing.T) {
 	items := mustMap(t, nested["items"])
 	if _, ok := items["format"]; ok {
 		t.Fatalf("expected nested uri format to be removed, got %+v", items)
+	}
+}
+
+func TestTranslateRequestUsesResponsesToolShape(t *testing.T) {
+	req := &domain.CanonicalRequest{
+		Model:    "gpt-5.2",
+		Messages: []domain.Message{},
+		Tools: json.RawMessage(`[
+			{"name":"Read","description":"read file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}
+		]`),
+	}
+
+	out, err := translateRequest(req, nil)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("expected one tool, got %d", len(out.Tools))
+	}
+	if got := out.Tools[0].Type; got != "function" {
+		t.Fatalf("expected tool type function, got %q", got)
+	}
+	if got := out.Tools[0].Name; got != "Read" {
+		t.Fatalf("expected tool name Read, got %q", got)
+	}
+
+	raw, err := json.Marshal(out.Tools[0])
+	if err != nil {
+		t.Fatalf("marshal tool: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal tool: %v", err)
+	}
+	if _, ok := decoded["function"]; ok {
+		t.Fatalf("expected Responses tool shape without nested function, got %+v", decoded)
 	}
 }
 

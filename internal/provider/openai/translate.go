@@ -26,11 +26,7 @@ type responsesRequest struct {
 }
 
 type responsesTool struct {
-	Type     string            `json:"type"`
-	Function responsesFunction `json:"function"`
-}
-
-type responsesFunction struct {
+	Type        string         `json:"type"`
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	Parameters  map[string]any `json:"parameters,omitempty"`
@@ -196,12 +192,10 @@ func translateTools(raw json.RawMessage, toolFilter string) ([]responsesTool, er
 			continue
 		}
 		out = append(out, responsesTool{
-			Type: "function",
-			Function: responsesFunction{
-				Name:        tool.Name,
-				Description: tool.Description,
-				Parameters:  cleanSchemaMap(tool.InputSchema),
-			},
+			Type:        "function",
+			Name:        tool.Name,
+			Description: tool.Description,
+			Parameters:  cleanSchemaMap(tool.InputSchema),
 		})
 	}
 	return out, nil
