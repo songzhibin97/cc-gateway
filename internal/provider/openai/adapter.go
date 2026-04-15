@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,6 +40,8 @@ func (a *Adapter) Stream(ctx context.Context, account *domain.Account, req *doma
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+
+	logRequestSummary(account, req, translated, len(body))
 
 	endpoint := buildResponsesURL(account.BaseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -183,4 +186,67 @@ func getHTTPClient(rawProxyURL string) (*http.Client, error) {
 	client := &http.Client{Transport: transport}
 	actual, _ := httpClientCache.LoadOrStore(cacheKey, client)
 	return actual.(*http.Client), nil
+}
+
+func logRequestSummary(account *domain.Account, req *domain.CanonicalRequest, translated *responsesRequest, bodyBytes int) {
+	if translated == nil {
+		return
+	}
+
+	inputTypes := summarizeInputTypes(translated.Input)
+	toolsCount := len(translated.Tools)
+	messageCount := len(req.Messages)
+	stopConfigured := len(req.StopSequences) > 0
+	reasoningEffort := ""
+	if translated.Reasoning != nil {
+		reasoningEffort = translated.Reasoning.Effort
+	}
+
+	slog.Info("openai upstream request summary",
+		slog.String("account_id", account.ID),
+		slog.String("provider", string(account.Provider)),
+		slog.String("model_requested", req.OriginalModel),
+		slog.String("model_actual", req.Model),
+		slog.Int("anthropic_message_count", messageCount),
+		slog.Int("responses_input_items", len(translated.Input)),
+		slog.Int("responses_tools_count", toolsCount),
+		slog.Any("responses_input_types", inputTypes),
+		slog.String("reasoning_effort", reasoningEffort),
+		slog.Bool("stop_sequences_present_on_input", stopConfigured),
+		slog.Int("request_body_bytes", bodyBytes),
+	)
+}
+
+func summarizeInputTypes(input []any) map[string]int {
+	summary := map[string]int{}
+	for _, item := range input {
+		switch v := item.(type) {
+		case map[string]any:
+			if itemType := strings.TrimSpace(stringValue(v["type"])); itemType != "" {
+				summary[itemType]++
+				continue
+			}
+			if role := strings.TrimSpace(stringValue(v["role"])); role != "" {
+				summary["message:"+role]++
+				if content, ok := v["content"].([]map[string]any); ok {
+					for _, part := range content {
+						if partType := strings.TrimSpace(stringValue(part["type"])); partType != "" {
+							summary["content:"+partType]++
+						}
+					}
+					continue
+				}
+				if content, ok := v["content"].([]any); ok {
+					for _, rawPart := range content {
+						if part, ok := rawPart.(map[string]any); ok {
+							if partType := strings.TrimSpace(stringValue(part["type"])); partType != "" {
+								summary["content:"+partType]++
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return summary
 }
